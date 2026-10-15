@@ -11,7 +11,7 @@ from email.utils import parsedate_to_datetime
 import html
 import re
 
-st.set_page_config(page_title='WAR TRADING — LIVE MARKET 2.5', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='WAR TRADING — LIVE MARKET 2.7', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
 BRT = ZoneInfo('America/Sao_Paulo')
 NOW = datetime.now(BRT)
 
@@ -22,6 +22,7 @@ ASSETS = [('NQ', 'Nasdaq Futuro', 'NQ=F'), ('ES', 'S&P 500 Futuro', 'ES=F'),
           ('VXN', 'Volatilidade Nasdaq', '^VXN'), ('XLK', 'ETF Tecnologia', 'XLK')]
 GROUP_WEIGHTS = {'mercado': .30, 'tecnologia': .25, 'juros_dolar': .25, 'volatilidade': .20}
 FUTURES = {'NQ=F', 'ES=F'}
+CASH_SYMBOLS = {'^SOX', '^TNX', '^VIX', '^VXN', 'XLK', 'NVDA', 'AAPL', 'MSFT', 'MU'}
 # Horário regular dos índices/ETFs/ações é tratado por idade de cotação, não por horário da página.
 # Fora do pregão, o indicador é informativo e nunca um sinal operacional em tempo real.
 
@@ -77,32 +78,44 @@ def load_quotes():
     symbols = list(dict.fromkeys([a[2] for a in ASSETS] + [s[0] for s in STOCKS]))
     out = {}
     try:
-        frame = yf.download(symbols, period='5d', interval='5m', group_by='ticker',
+        frame = yf.download(symbols, period='7d', interval='5m', group_by='ticker',
                             auto_adjust=False, progress=False, threads=True, timeout=15)
     except Exception:
         frame = pd.DataFrame()
     try:
-        daily = yf.download(symbols, period='14d', interval='1d', group_by='ticker',
+        daily = yf.download(symbols, period='20d', interval='1d', group_by='ticker',
                             auto_adjust=False, progress=False, threads=True, timeout=15)
     except Exception:
         daily = pd.DataFrame()
     for sym in symbols:
         try:
             intraday = part_for(frame, sym)
-            if intraday is None:
-                continue
-            closes = pd.to_numeric(intraday['Close'], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
-            closes = closes[closes > 0]
-            if closes.empty:
-                continue
-            ts = pd.Timestamp(closes.index[-1])
-            if ts.tzinfo is None:
-                continue
-            stamp = ts.tz_convert(BRT).to_pydatetime()
-            price = float(closes.iloc[-1])
-            item = {'price': price, 'time': stamp, 'series': closes.tail(32).tolist(),
-                    'pct': None, 'reference_date': None}
             dpart = part_for(daily, sym)
+            closes = (pd.to_numeric(intraday['Close'], errors='coerce')
+                      .replace([np.inf, -np.inf], np.nan).dropna()) if intraday is not None else pd.Series(dtype=float)
+            closes = closes[closes > 0]
+            daily_fallback = False
+            if not closes.empty:
+                ts = pd.Timestamp(closes.index[-1])
+                if ts.tzinfo is None:
+                    continue
+                stamp = ts.tz_convert(BRT).to_pydatetime()
+                price = float(closes.iloc[-1])
+            elif dpart is not None:
+                # Último fechamento diário, caso a fonte não entregue barras intradiárias.
+                dc = pd.to_numeric(dpart['Close'], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+                dc = dc[dc > 0]
+                if dc.empty:
+                    continue
+                last_day = pd.Timestamp(dc.index[-1]).date()
+                stamp = datetime.combine(last_day, datetime.min.time(), tzinfo=BRT).replace(hour=17)
+                price = float(dc.iloc[-1])
+                closes = dc.tail(32)
+                daily_fallback = True
+            else:
+                continue
+            item = {'price': price, 'time': stamp, 'series': closes.tail(32).tolist(),
+                    'pct': None, 'reference_date': None, 'daily_fallback': daily_fallback}
             if dpart is not None:
                 d = pd.to_numeric(dpart['Close'], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
                 d = d[d > 0]
@@ -122,61 +135,114 @@ def load_quotes():
     return out
 
 
-def freshness(q, symbol):
+def market_closed(symbol):
+    """Horários aproximados NY; feriados e sessões especiais não são inferidos."""
+    ny = NOW.astimezone(ZoneInfo('America/New_York'))
+    weekday = ny.weekday()
+    minutes = ny.hour * 60 + ny.minute
+    if symbol in FUTURES:
+        # CME: pausa diária aproximada 17:00-18:00 NY; fim de semana.
+        return (weekday == 5 or (weekday == 6 and minutes < 18 * 60)
+                or (weekday == 4 and minutes >= 17 * 60)
+                or (weekday < 5 and 17 * 60 <= minutes < 18 * 60))
+    if symbol == 'DX-Y.NYB':
+        # Horário variável conforme fornecedor; fim de semana é inequívoco.
+        return weekday >= 5
+    return weekday >= 5 or minutes < 9 * 60 + 30 or minutes >= 16 * 60
+
+
+def quote_status(q, symbol):
+    """Preserva fechamentos identificados; nunca trata preço antigo como ao vivo."""
     if not q or q.get('pct') is None or q.get('time') is None:
-        return False
+        return 'sem_referencia'
     age = NOW - q['time']
-    # Limite de idade do dado para cálculo; após fechamento, sinais à vista expiram.
-    limit = timedelta(minutes=45) if symbol in FUTURES else timedelta(minutes=90)
-    return timedelta(minutes=-5) <= age <= limit
+    if age < timedelta(minutes=-5):
+        return 'obsoleta'
+    limit = timedelta(minutes=60) if symbol in FUTURES or symbol == 'DX-Y.NYB' else timedelta(minutes=90)
+    if age <= limit and not q.get('daily_fallback'):
+        return 'recente'
+    if market_closed(symbol) and age <= timedelta(days=7):
+        return 'fechamento'
+    return 'obsoleta'
+
+
+def freshness(q, symbol):
+    return quote_status(q, symbol) in ('recente', 'fechamento')
 
 
 def score_news_title(title):
     t = title.casefold()
-    excluded = ('ballroom', 'donor', 'wedding', 'celebrity', 'football', 'soccer',
-                'insider sells', 'insider buys', 'price target', 'analyst rating',
-                'stock price down', 'stock price up', 'here\'s why', 'here\'s what happened',
-                'shares sold', 'shares bought', 'class action', 'lawsuit filed')
+    # Evita falsos positivos: "rate hike" pode ser tarifa de energia ou seguros.
+    excluded = ('utility rate', 'electric rate', 'water rate', 'insurance rate',
+                'rate hike for', 'rate hike on', 'rate increase for', 'rate increase on',
+                'consumers rate hike', 'rate hike approved', 'local jobs report',
+                'state releases', 'school', 'county', 'city council', 'ballroom',
+                'wedding', 'celebrity', 'football', 'soccer', 'insider sells',
+                'insider buys', 'price target', 'analyst rating', 'stock price down',
+                'stock price up', "here's why", "here's what happened", 'shares sold',
+                'shares bought', 'class action', 'lawsuit filed')
     if any(x in t for x in excluded):
         return None
     categories = [
-        ('FED / JUROS', 10, ('federal reserve', 'fed chair', 'fed decision', 'fomc',
-                              'fed officials', 'rate cut', 'rate hike', 'interest rates')),
-        ('INFLAÇÃO / EMPREGO', 10, ('consumer price index', 'cpi inflation', 'inflation data',
-                                    'core pce', 'pce inflation', 'nonfarm payroll',
-                                    'jobs report', 'unemployment rate', 'producer price index')),
-        ('TREASURIES / DÓLAR', 8, ('treasury yields', 'treasury yield', '10-year yield',
-                                   'bond yields', 'us dollar index', 'dollar index')),
-        ('NASDAQ / MERCADO', 9, ('nasdaq 100', 'nasdaq-100', 'nasdaq futures',
-                                 'nasdaq composite', 'wall street', 's&p 500', 'us stock futures')),
-        ('BALANÇOS BIG TECH', 9, ('nvidia earnings', 'microsoft earnings', 'apple earnings',
-                                   'amazon earnings', 'alphabet earnings', 'google earnings',
-                                   'meta earnings', 'tesla earnings', 'micron earnings',
-                                   'broadcom earnings', 'earnings guidance')),
-        ('SEMICONDUTORES / IA', 7, ('semiconductor stocks', 'chip stocks', 'ai chip',
-                                    'nvidia', 'semiconductor export', 'artificial intelligence spending')),
+        ('FED / JUROS', 12, ('federal reserve', 'fomc', 'fed chair', 'fed governor',
+                             'fed officials', 'fed rate', 'fed cuts', 'fed hikes',
+                             'powell says', 'banco central americano')),
+        ('INFLAÇÃO / EMPREGO', 12, ('us cpi', 'u.s. cpi', 'consumer price index',
+                                    'core pce', 'pce inflation', 'us payrolls',
+                                    'nonfarm payroll', 'us jobs report',
+                                    'u.s. jobs report', 'us unemployment',
+                                    'u.s. unemployment', 'producer price index')),
+        ('TREASURIES / DÓLAR', 10, ('treasury yields', 'treasury yield', '10-year yield',
+                                    'us 10-year', 'u.s. 10-year', 'dollar index',
+                                    'dxy', 'rendimento dos treasuries')),
+        ('NASDAQ / MERCADO', 11, ('nasdaq 100', 'nasdaq-100', 'nasdaq futures',
+                                  'nasdaq composite', 'wall street stocks',
+                                  's&p 500 futures', 'us stock futures',
+                                  'u.s. stock futures', 'futuros do nasdaq')),
+        ('BALANÇOS BIG TECH', 11, ('nvidia earnings', 'microsoft earnings',
+                                   'apple earnings', 'amazon earnings',
+                                   'alphabet earnings', 'meta earnings',
+                                   'tesla earnings', 'micron earnings',
+                                   'broadcom earnings', 'big tech earnings')),
+        ('SEMICONDUTORES / IA', 9, ('semiconductor stocks', 'chip stocks',
+                                    'ai chip', 'semiconductor export',
+                                    'chip export restrictions', 'nvidia ai chips')),
     ]
-    hits = [(priority, category) for category, priority, phrases in categories
+    hits = [(weight, category) for category, weight, phrases in categories
             if any(phrase in t for phrase in phrases)]
-    if not hits:
-        return None
-    priority, category = max(hits)
-    # Manchetes puramente sobre um único papel não superam dados macro.
-    if category == 'SEMICONDUTORES / IA' and not any(k in t for k in
-        ('earnings', 'guidance', 'chip', 'semiconductor', 'export', 'ai spending', 'artificial intelligence')):
-        return None
-    return priority, category
+    return max(hits) if hits else None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def translate_title(title):
+    """Tradução automática best-effort, preservando o original se falhar."""
+    try:
+        response = requests.get('https://translate.googleapis.com/translate_a/single',
+            params={'client': 'gtx', 'sl': 'auto', 'tl': 'pt', 'dt': 't', 'q': title},
+            timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+        response.raise_for_status()
+        chunks = response.json()[0]
+        translated = ''.join(part[0] for part in chunks if part and part[0]).strip()
+        return translated if translated else title
+    except Exception:
+        return title
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_news():
     searches = [
-        '("Federal Reserve" OR FOMC OR "rate cut" OR "rate hike") when:1d',
-        '("CPI" OR "PCE inflation" OR "jobs report" OR "Treasury yields") when:1d',
-        '("Nasdaq 100" OR "Nasdaq futures" OR "S&P 500" OR "Wall Street") when:1d',
-        '("Nvidia earnings" OR "Microsoft earnings" OR "Apple earnings" OR "Alphabet earnings" OR "Amazon earnings" OR "Meta earnings") when:1d',
-        '("semiconductor stocks" OR "chip stocks" OR "AI chip" OR "Micron earnings") when:1d',
+        '("Federal Reserve" OR FOMC OR "Jerome Powell") (stocks OR markets OR rates) when:1d',
+        '("US CPI" OR "core PCE" OR "nonfarm payroll" OR "Treasury yields") when:1d',
+        '("Nasdaq 100" OR "Nasdaq futures" OR "S&P 500 futures") when:1d',
+        '("Nvidia earnings" OR "Microsoft earnings" OR "Apple earnings" OR "Amazon earnings" OR "Meta earnings") when:1d',
+        '("semiconductor stocks" OR "AI chip" OR "chip export restrictions") when:1d',
     ]
+    # Fontes de cobertura econômica/financeira. Fonte não equivale a confirmação
+    # de impacto: o filtro só lê títulos, não o corpo da notícia.
+    allowed = ('reuters', 'bloomberg', 'cnbc', 'associated press', 'ap news',
+               'marketwatch', 'yahoo finance', 'financial times', 'barron',
+               'wall street journal', 'investing.com', 'the economist',
+               'the guardian', 'fortune', 'business insider')
     found = {}
     for query in searches:
         url = f'https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en'
@@ -187,40 +253,40 @@ def load_news():
             for item in root.findall('.//item'):
                 title = html.unescape(item.findtext('title') or '').strip()
                 link = (item.findtext('link') or '').strip()
-                source = (item.findtext('source') or 'Google News').strip()
+                source = (item.findtext('source') or '').strip()
+                if not title or not link.startswith('https://') or not any(x in source.casefold() for x in allowed):
+                    continue
                 try:
                     when = parsedate_to_datetime(item.findtext('pubDate') or '').astimezone(BRT)
                 except Exception:
                     continue
-                if not title or not link.startswith('https://'):
-                    continue
                 age = NOW - when
                 if not timedelta(minutes=-5) <= age <= timedelta(hours=24):
                     continue
-                ranking = score_news_title(title)
-                if ranking is None:
+                ranked = score_news_title(title)
+                if ranked is None:
                     continue
-                priority, category = ranking
-                # Ranking por relevância e recência, não apenas pela hora.
+                priority, category = ranked
                 points = priority * 100 - age.total_seconds() / 3600 * 3
                 key = re.sub(r'[^a-z0-9]+', '', title.casefold().split(' - ')[0])[:100]
-                row = {'title': title, 'url': link, 'source': source, 'when': when,
-                       'category': category, 'points': points}
+                row = {'title': title, 'url': link, 'source': source,
+                       'when': when, 'category': category, 'points': points}
                 if key not in found or points > found[key]['points']:
                     found[key] = row
         except Exception:
             continue
     ordered = sorted(found.values(), key=lambda n: (n['points'], n['when']), reverse=True)
-    # Diversidade temática: até 2 notícias de uma mesma categoria.
     chosen, counts = [], {}
     for item in ordered:
-        cat = item['category']
-        if counts.get(cat, 0) >= 2:
+        category = item['category']
+        if counts.get(category, 0) >= 2:
             continue
         chosen.append(item)
-        counts[cat] = counts.get(cat, 0) + 1
+        counts[category] = counts.get(category, 0) + 1
         if len(chosen) == 3:
             break
+    for item in chosen:
+        item['title_pt'] = translate_title(item['title'])
     return chosen
 
 
@@ -280,12 +346,14 @@ def asset_card(name, subtitle, q, symbol, extra=''):
         return f'<div class="asset stale"><div class="asset-name">{name}</div><div class="muted">{subtitle}</div><div class="asset-price">Indisponível</div><div class="tiny">Fonte sem dados</div></div>'
     pct = q.get('pct')
     up = pct is not None and pct >= 0
-    valid = freshness(q, symbol)
+    status = quote_status(q, symbol)
+    valid = status in ('recente', 'fechamento')
     cls = 'stale' if not valid else ('up' if up else 'down')
     color = '#14dc99' if up else '#ff4d72'
     delta = f'{"▲" if up else "▼"} {pct:+.2f}%' if pct is not None else 'Variação indisponível'
     when = q['time'].strftime('%d/%m %H:%M') if q.get('time') else 'Horário indisponível'
-    suffix = '' if valid else ' · ATRASADA / NÃO ENTRA NO SCORE'
+    suffix = (' · ÚLTIMO FECHAMENTO / SCORE INFORMATIVO' if status == 'fechamento'
+              else '' if valid else ' · ATRASADA / NÃO ENTRA NO SCORE')
     price = f'{q["price"]:,.2f}'
     return (f'<div class="asset {cls}"><div class="asset-name">{name}</div><div class="muted">{subtitle}{extra}</div>'
             f'<div class="asset-bottom"><span class="asset-price">{price}</span>'
@@ -298,17 +366,19 @@ st.markdown('<meta http-equiv="refresh" content="60">', unsafe_allow_html=True)
 with st.spinner('Consultando mercado...'):
     quotes = load_quotes()
 score, coverage, groups = calc_score(quotes)
+using_closes = any(quote_status(quotes.get(sym), sym) == 'fechamento' for _, _, sym in ASSETS)
 classification, status_color = classify(score)
 score_str = f'{score:+d}' if score is not None else '—'
+score_mode = 'LEITURA COM ÚLTIMOS FECHAMENTOS · INFORMATIVA' if using_closes else 'LEITURA COM COTAÇÕES RECENTES'
 
-st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 2.5</div>
+st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 2.7</div>
 <div class="muted">BRASÍLIA · {NOW.strftime('%d/%m/%Y %H:%M:%S')} · ↻ 60 SEG</div></div>''', unsafe_allow_html=True)
 position = 50 if score is None else (score + 100) / 2
 st.markdown(f'''<div class="summary-grid">
 <div class="war-panel"><div class="section">CONCLUSÃO PARA O MNQ</div>
 <div class="status" style="color:{status_color}">{classification}</div>
 <div class="muted">Leitura intermarket: {score_str}. Cobertura de grupos: {coverage:.0%}.
-NQ é referência, não soma. Indicador experimental, não é sinal de entrada.</div></div>
+{score_mode}. NQ é referência, não soma. Indicador experimental; não é sinal de entrada.</div></div>
 <div class="war-panel"><div class="section">WAR SCORE MNQ</div>
 <div class="status" style="text-align:center">{score_str}</div>
 <div class="gauge"><div class="gauge-pin" style="left:{position}%"></div></div>
@@ -336,7 +406,7 @@ if not impact_html:
 news = load_news()
 news_html = ''
 for i, item in enumerate(news, 1):
-    title = html.escape(item['title'])
+    title = html.escape(item.get('title_pt', item['title']))
     source = html.escape(item['source'])
     url = html.escape(item['url'], quote=True)
     category = html.escape(item['category'])
@@ -345,9 +415,9 @@ for i, item in enumerate(news, 1):
                   f'<a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a>'
                   f'<div class="tiny">{item["when"].strftime("%d/%m %H:%M")} BRT · {source} · impacto direcional não classificado</div></div>')
 if not news_html:
-    news_html = '<div class="tiny">Nenhuma notícia com relevância suficiente nas últimas 24h. Não exibimos notícias genéricas para preencher espaço.</div>'
+    news_html = '<div class="tiny">Nenhuma manchete verificada de fonte financeira e relevância suficiente nas últimas 24h. Não exibimos notícias genéricas para preencher espaço.</div>'
 
 # Quadros propositalmente EMPILHADOS, inclusive em telas grandes.
 st.markdown(f'<div class="war-panel"><div class="section">MAIORES IMPACTOS NO MNQ</div>{impact_html}<div class="tiny">Grupos agregados para reduzir dupla contagem. Pesos experimentais.</div></div>', unsafe_allow_html=True)
 st.markdown(f'<div class="war-panel"><div class="section">NOTÍCIAS RELEVANTES · TOP 3 POR PRIORIDADE</div>{news_html}</div>', unsafe_allow_html=True)
-st.markdown('''<div class="war-panel tiny">Cotações: Yahoo Finance (yfinance), sujeitas a atrasos e indisponibilidade. Notícias: Google News RSS; ranking heurístico por tema e recência, sem leitura do conteúdo integral. Atualização da página a cada 60 segundos, quando o navegador permitir. Percentuais contra o último fechamento diário anterior disponível. Cotações fora do limite de idade não entram no WAR SCORE. Pesos, sinais inversos e escala de intensidade são hipóteses não validadas por backtest; o WAR SCORE não é recomendação nem sinal de entrada.</div>''', unsafe_allow_html=True)
+st.markdown('''<div class="war-panel tiny">Cotações: Yahoo Finance (yfinance), sujeitas a atrasos e indisponibilidade. Notícias: Google News RSS, fontes financeiras selecionadas e tradução automática (pode falhar); classificação heurística sem leitura do conteúdo integral. Atualização da página a cada 60 segundos, quando o navegador permitir. Percentuais contra o último fechamento diário anterior disponível. Com mercado fechado, últimos preços disponíveis (até 7 dias) podem compor SCORE INFORMATIVO; dados antigos durante mercado aberto são excluídos. Feriados e horários especiais podem exigir revisão. Pesos, sinais inversos e escala de intensidade são hipóteses não validadas por backtest; o WAR SCORE não é recomendação nem sinal de entrada.</div>''', unsafe_allow_html=True)
