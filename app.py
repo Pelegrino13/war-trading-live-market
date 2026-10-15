@@ -11,7 +11,7 @@ from email.utils import parsedate_to_datetime
 import html
 import re
 
-st.set_page_config(page_title='WAR TRADING — LIVE MARKET 2.3', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='WAR TRADING — LIVE MARKET 2.4', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
 BRT = ZoneInfo('America/Sao_Paulo')
 NOW = datetime.now(BRT)
 
@@ -251,7 +251,7 @@ score, coverage, groups = calc_score(quotes)
 classification, status_color = classify(score)
 score_str = f'{score:+d}' if score is not None else '—'
 
-st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 2.3</div>
+st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 2.4</div>
 <div class="muted">BRASÍLIA · {NOW.strftime('%d/%m/%Y %H:%M:%S')} · ↻ 60 SEG</div></div>''', unsafe_allow_html=True)
 position = 50 if score is None else (score+100)/2
 st.markdown(f'''<div class="summary-grid">
@@ -291,11 +291,9 @@ for i,n in enumerate(news,1):
     news_html+=f'<div class="news"><span class="news-num">{i}</span> <a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a><div class="tiny">{n["when"].strftime("%d/%m %H:%M")} BRT · {source} · impacto não classificado</div></div>'
 if not news_html:
     news_html='<div class="tiny">Nenhuma notícia suficientemente relevante disponível. Não exibimos manchetes inventadas.</div>'
-st.markdown(f'''<div class="summary-grid">
-<div class="war-panel"><div class="section">MAIORES IMPACTOS NO MNQ</div>{impact_html}
-<div class="tiny">Grupos agregados para reduzir dupla contagem. Pesos experimentais.</div></div>
-<div class="war-panel"><div class="section">NOTÍCIAS RELEVANTES · ÚLTIMAS 3</div>{news_html}</div>
-</div>''',unsafe_allow_html=True)
+st.markdown(f'''<div class="war-panel"><div class="section">MAIORES IMPACTOS NO MNQ</div>{impact_html}
+<div class="tiny">Grupos agregados para reduzir dupla contagem. Pesos experimentais.</div></div>''', unsafe_allow_html=True)
+st.markdown(f'''<div class="war-panel"><div class="section">NOTÍCIAS RELEVANTES · ÚLTIMAS 3</div>{news_html}</div>''', unsafe_allow_html=True)
 st.markdown('''<div class="war-panel tiny">Cotações: Yahoo Finance (yfinance); dados podem atrasar.
 Notícias: Google News RSS, com links para as fontes. Atualização da página a cada 60 segundos.
 Cotações antigas são excluídas do WAR SCORE, mas podem aparecer nos cartões marcadas como ATRASADAS.
