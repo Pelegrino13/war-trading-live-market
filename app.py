@@ -4,17 +4,16 @@ import pandas as pd
 import numpy as np
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from email.utils import parsedate_to_datetime
 import html
 import re
 
-st.set_page_config(page_title='WAR TRADING — LIVE MARKET 2.7', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='WAR TRADING — LIVE MARKET 2.8', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
 BRT = ZoneInfo('America/Sao_Paulo')
-NOW = datetime.now(BRT)
-
+NY = ZoneInfo('America/New_York')
 STOCKS = [('NVDA', 'Nvidia', 8.31), ('AAPL', 'Apple', 7.51), ('MSFT', 'Microsoft', 6.09), ('MU', 'Micron', 4.48)]
 ASSETS = [('NQ', 'Nasdaq Futuro', 'NQ=F'), ('ES', 'S&P 500 Futuro', 'ES=F'),
           ('SOX', 'Semicondutores', '^SOX'), ('US10Y', 'Treasury 10 anos', '^TNX'),
@@ -23,8 +22,6 @@ ASSETS = [('NQ', 'Nasdaq Futuro', 'NQ=F'), ('ES', 'S&P 500 Futuro', 'ES=F'),
 GROUP_WEIGHTS = {'mercado': .30, 'tecnologia': .25, 'juros_dolar': .25, 'volatilidade': .20}
 FUTURES = {'NQ=F', 'ES=F'}
 CASH_SYMBOLS = {'^SOX', '^TNX', '^VIX', '^VXN', 'XLK', 'NVDA', 'AAPL', 'MSFT', 'MU'}
-# Horário regular dos índices/ETFs/ações é tratado por idade de cotação, não por horário da página.
-# Fora do pregão, o indicador é informativo e nunca um sinal operacional em tempo real.
 
 st.markdown('''<style>
 #MainMenu, footer {visibility:hidden}
@@ -67,155 +64,157 @@ def part_for(frame, symbol):
     if frame is None or frame.empty:
         return None
     if isinstance(frame.columns, pd.MultiIndex):
-        if symbol not in frame.columns.get_level_values(0):
-            return None
-        return frame[symbol]
+        if symbol in frame.columns.get_level_values(0):
+            return frame[symbol]
+        if symbol in frame.columns.get_level_values(1):
+            return frame.xs(symbol, axis=1, level=1)
+        return None
     return frame
+
+
+def cleaned_close(frame):
+    if frame is None or 'Close' not in frame:
+        return pd.Series(dtype=float)
+    values = pd.to_numeric(frame['Close'], errors='coerce')
+    if isinstance(values, pd.DataFrame):
+        values = values.iloc[:, 0]
+    return values.replace([np.inf, -np.inf], np.nan).dropna().loc[lambda x: x > 0]
 
 
 @st.cache_data(ttl=55, show_spinner=False)
 def load_quotes():
     symbols = list(dict.fromkeys([a[2] for a in ASSETS] + [s[0] for s in STOCKS]))
-    out = {}
     try:
-        frame = yf.download(symbols, period='7d', interval='5m', group_by='ticker',
-                            auto_adjust=False, progress=False, threads=True, timeout=15)
+        intraday = yf.download(symbols, period='7d', interval='5m', group_by='ticker',
+                               auto_adjust=False, progress=False, threads=True, timeout=15)
     except Exception:
-        frame = pd.DataFrame()
+        intraday = pd.DataFrame()
     try:
         daily = yf.download(symbols, period='20d', interval='1d', group_by='ticker',
                             auto_adjust=False, progress=False, threads=True, timeout=15)
     except Exception:
         daily = pd.DataFrame()
+    out = {}
     for sym in symbols:
         try:
-            intraday = part_for(frame, sym)
-            dpart = part_for(daily, sym)
-            closes = (pd.to_numeric(intraday['Close'], errors='coerce')
-                      .replace([np.inf, -np.inf], np.nan).dropna()) if intraday is not None else pd.Series(dtype=float)
-            closes = closes[closes > 0]
-            daily_fallback = False
-            if not closes.empty:
-                ts = pd.Timestamp(closes.index[-1])
-                if ts.tzinfo is None:
-                    continue
-                stamp = ts.tz_convert(BRT).to_pydatetime()
-                price = float(closes.iloc[-1])
-            elif dpart is not None:
-                # Último fechamento diário, caso a fonte não entregue barras intradiárias.
-                dc = pd.to_numeric(dpart['Close'], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
-                dc = dc[dc > 0]
-                if dc.empty:
-                    continue
-                last_day = pd.Timestamp(dc.index[-1]).date()
-                stamp = datetime.combine(last_day, datetime.min.time(), tzinfo=BRT).replace(hour=17)
-                price = float(dc.iloc[-1])
-                closes = dc.tail(32)
-                daily_fallback = True
+            i = cleaned_close(part_for(intraday, sym))
+            d = cleaned_close(part_for(daily, sym))
+            daily_fallback = i.empty
+            if not i.empty:
+                timestamp = pd.Timestamp(i.index[-1])
+                if timestamp.tzinfo is None:
+                    continue  # Não inventar fuso de barras intradiárias.
+                stamp = timestamp.tz_convert(BRT).to_pydatetime()
+                price = float(i.iloc[-1])
+                series = i.tail(32).tolist()
+            elif not d.empty:
+                # Data diária sem hora real: NÃO afirmar que o fechamento foi às 17h.
+                day = pd.Timestamp(d.index[-1]).date()
+                stamp = datetime.combine(day, time(0, 0), tzinfo=BRT)
+                price = float(d.iloc[-1])
+                series = d.tail(32).tolist()
             else:
                 continue
-            item = {'price': price, 'time': stamp, 'series': closes.tail(32).tolist(),
-                    'pct': None, 'reference_date': None, 'daily_fallback': daily_fallback}
-            if dpart is not None:
-                d = pd.to_numeric(dpart['Close'], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
-                d = d[d > 0]
-                # Somente fechamento de dia ANTERIOR à data da cotação intradiária.
-                # Evita comparar com barra diária parcial ou futura.
-                past = [(pd.Timestamp(idx).date(), float(value)) for idx, value in d.items()
-                        if pd.Timestamp(idx).date() < stamp.date()]
-                if past:
-                    ref_date, reference = past[-1]
-                    # Proteção contra fechamento muito antigo em dias úteis.
-                    if (stamp.date() - ref_date).days <= 5 and reference > 0:
-                        item['pct'] = (price / reference - 1) * 100
-                        item['reference_date'] = ref_date
-            out[sym] = item
+            reference = None
+            reference_date = None
+            # Barras diárias podem incluir dia atual parcial; usar apenas dia anterior.
+            if not daily_fallback:
+                candidates = [(pd.Timestamp(idx).date(), float(v)) for idx, v in d.items()
+                              if pd.Timestamp(idx).date() < stamp.date()]
+            else:
+                candidates = [(pd.Timestamp(idx).date(), float(v)) for idx, v in d.iloc[:-1].items()]
+            if candidates:
+                reference_date, reference = candidates[-1]
+            pct = None
+            if reference and reference > 0 and (stamp.date() - reference_date).days <= 5:
+                pct = (price / reference - 1) * 100
+            out[sym] = dict(price=price, time=stamp, series=series, pct=pct,
+                            reference_date=reference_date, daily_fallback=daily_fallback)
         except Exception:
             continue
     return out
 
 
-def market_closed(symbol):
-    """Horários aproximados NY; feriados e sessões especiais não são inferidos."""
-    ny = NOW.astimezone(ZoneInfo('America/New_York'))
-    weekday = ny.weekday()
-    minutes = ny.hour * 60 + ny.minute
+def session_open(symbol, now):
+    """Aproximação das sessões NY; não é calendário de feriados da bolsa."""
+    ny = now.astimezone(NY)
+    day, minute = ny.weekday(), ny.hour * 60 + ny.minute
     if symbol in FUTURES:
-        # CME: pausa diária aproximada 17:00-18:00 NY; fim de semana.
-        return (weekday == 5 or (weekday == 6 and minutes < 18 * 60)
-                or (weekday == 4 and minutes >= 17 * 60)
-                or (weekday < 5 and 17 * 60 <= minutes < 18 * 60))
+        return ((day == 6 and minute >= 18 * 60) or
+                (day in (0, 1, 2, 3) and not (17 * 60 <= minute < 18 * 60)) or
+                (day == 4 and minute < 17 * 60))
     if symbol == 'DX-Y.NYB':
-        # Horário variável conforme fornecedor; fim de semana é inequívoco.
-        return weekday >= 5
-    return weekday >= 5 or minutes < 9 * 60 + 30 or minutes >= 16 * 60
+        return day < 5  # Horários específicos do DXY variam por fornecedor.
+    return day < 5 and 9 * 60 + 30 <= minute < 16 * 60
 
 
-def quote_status(q, symbol):
-    """Preserva fechamentos identificados; nunca trata preço antigo como ao vivo."""
+def quote_status(q, symbol, now):
     if not q or q.get('pct') is None or q.get('time') is None:
         return 'sem_referencia'
-    age = NOW - q['time']
+    age = now - q['time']
     if age < timedelta(minutes=-5):
         return 'obsoleta'
-    limit = timedelta(minutes=60) if symbol in FUTURES or symbol == 'DX-Y.NYB' else timedelta(minutes=90)
-    if age <= limit and not q.get('daily_fallback'):
+    if q.get('daily_fallback'):
+        # Fechamento diário não possui timestamp intradiário confiável.
+        return 'fechamento' if not session_open(symbol, now) and age <= timedelta(days=4) else 'obsoleta'
+    limit = timedelta(minutes=20) if symbol in FUTURES or symbol == 'DX-Y.NYB' else timedelta(minutes=25)
+    if age <= limit:
         return 'recente'
-    if market_closed(symbol) and age <= timedelta(days=7):
+    if not session_open(symbol, now) and age <= timedelta(days=4):
         return 'fechamento'
     return 'obsoleta'
 
 
-def freshness(q, symbol):
-    return quote_status(q, symbol) in ('recente', 'fechamento')
-
-
 def score_news_title(title):
     t = title.casefold()
-    # Evita falsos positivos: "rate hike" pode ser tarifa de energia ou seguros.
     excluded = ('utility rate', 'electric rate', 'water rate', 'insurance rate',
                 'rate hike for', 'rate hike on', 'rate increase for', 'rate increase on',
-                'consumers rate hike', 'rate hike approved', 'local jobs report',
-                'state releases', 'school', 'county', 'city council', 'ballroom',
-                'wedding', 'celebrity', 'football', 'soccer', 'insider sells',
-                'insider buys', 'price target', 'analyst rating', 'stock price down',
-                'stock price up', "here's why", "here's what happened", 'shares sold',
+                'local jobs report', 'state releases', 'school', 'county', 'city council',
+                'ballroom', 'wedding', 'celebrity', 'football', 'soccer', 'insider sells',
+                'insider buys', 'price target', 'analyst rating', 'shares sold',
                 'shares bought', 'class action', 'lawsuit filed')
     if any(x in t for x in excluded):
         return None
     categories = [
         ('FED / JUROS', 12, ('federal reserve', 'fomc', 'fed chair', 'fed governor',
-                             'fed officials', 'fed rate', 'fed cuts', 'fed hikes',
-                             'powell says', 'banco central americano')),
+                              'fed officials', 'fed rate', 'fed cuts', 'fed hikes', 'powell says')),
         ('INFLAÇÃO / EMPREGO', 12, ('us cpi', 'u.s. cpi', 'consumer price index',
                                     'core pce', 'pce inflation', 'us payrolls',
-                                    'nonfarm payroll', 'us jobs report',
-                                    'u.s. jobs report', 'us unemployment',
-                                    'u.s. unemployment', 'producer price index')),
+                                    'nonfarm payroll', 'us jobs report', 'u.s. jobs report',
+                                    'us unemployment', 'producer price index')),
         ('TREASURIES / DÓLAR', 10, ('treasury yields', 'treasury yield', '10-year yield',
-                                    'us 10-year', 'u.s. 10-year', 'dollar index',
-                                    'dxy', 'rendimento dos treasuries')),
+                                    'us 10-year', 'u.s. 10-year', 'dollar index', 'dxy')),
         ('NASDAQ / MERCADO', 11, ('nasdaq 100', 'nasdaq-100', 'nasdaq futures',
                                   'nasdaq composite', 'wall street stocks',
-                                  's&p 500 futures', 'us stock futures',
-                                  'u.s. stock futures', 'futuros do nasdaq')),
+                                  's&p 500 futures', 'us stock futures', 'u.s. stock futures')),
         ('BALANÇOS BIG TECH', 11, ('nvidia earnings', 'microsoft earnings',
                                    'apple earnings', 'amazon earnings',
                                    'alphabet earnings', 'meta earnings',
-                                   'tesla earnings', 'micron earnings',
-                                   'broadcom earnings', 'big tech earnings')),
-        ('SEMICONDUTORES / IA', 9, ('semiconductor stocks', 'chip stocks',
-                                    'ai chip', 'semiconductor export',
-                                    'chip export restrictions', 'nvidia ai chips')),
+                                   'tesla earnings', 'micron earnings', 'broadcom earnings')),
+        ('SEMICONDUTORES / IA', 9, ('semiconductor stocks', 'chip stocks', 'ai chip',
+                                    'semiconductor export', 'chip export restrictions', 'nvidia ai chips')),
     ]
     hits = [(weight, category) for category, weight, phrases in categories
             if any(phrase in t for phrase in phrases)]
     return max(hits) if hits else None
 
 
+def news_direction(title):
+    """Apenas manchetes com movimento explícito de índices/futuros; sem inferir causalidade."""
+    t = title.casefold()
+    if not any(x in t for x in ('nasdaq', 's&p 500', 'stock futures', 'stocks', 'wall street')):
+        return None
+    positive = (r'\b(rise|rises|rose|gain|gains|gained|rally|rallies|jump|jumps|surge|surges|rebound|rebounds|climb|climbs)\b',)
+    negative = (r'\b(fall|falls|fell|drop|drops|dropped|slide|slides|slump|slumps|sink|sinks|tumble|tumbles|plunge|plunges)\b',)
+    up = any(re.search(p, t) for p in positive)
+    down = any(re.search(p, t) for p in negative)
+    if up == down:
+        return None
+    return 'POSITIVO NASDAQ' if up else 'NEGATIVO NASDAQ'
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def translate_title(title):
-    """Tradução automática best-effort, preservando o original se falhar."""
     try:
         response = requests.get('https://translate.googleapis.com/translate_a/single',
             params={'client': 'gtx', 'sl': 'auto', 'tl': 'pt', 'dt': 't', 'q': title},
@@ -223,13 +222,14 @@ def translate_title(title):
         response.raise_for_status()
         chunks = response.json()[0]
         translated = ''.join(part[0] for part in chunks if part and part[0]).strip()
-        return translated if translated else title
+        return translated or title
     except Exception:
         return title
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_news():
+    now = datetime.now(BRT)  # Atualizar dentro da função cacheada, não usar hora global.
     searches = [
         '("Federal Reserve" OR FOMC OR "Jerome Powell") (stocks OR markets OR rates) when:1d',
         '("US CPI" OR "core PCE" OR "nonfarm payroll" OR "Treasury yields") when:1d',
@@ -237,8 +237,6 @@ def load_news():
         '("Nvidia earnings" OR "Microsoft earnings" OR "Apple earnings" OR "Amazon earnings" OR "Meta earnings") when:1d',
         '("semiconductor stocks" OR "AI chip" OR "chip export restrictions") when:1d',
     ]
-    # Fontes de cobertura econômica/financeira. Fonte não equivale a confirmação
-    # de impacto: o filtro só lê títulos, não o corpo da notícia.
     allowed = ('reuters', 'bloomberg', 'cnbc', 'associated press', 'ap news',
                'marketwatch', 'yahoo finance', 'financial times', 'barron',
                'wall street journal', 'investing.com', 'the economist',
@@ -260,7 +258,7 @@ def load_news():
                     when = parsedate_to_datetime(item.findtext('pubDate') or '').astimezone(BRT)
                 except Exception:
                     continue
-                age = NOW - when
+                age = now - when
                 if not timedelta(minutes=-5) <= age <= timedelta(hours=24):
                     continue
                 ranked = score_news_title(title)
@@ -269,8 +267,8 @@ def load_news():
                 priority, category = ranked
                 points = priority * 100 - age.total_seconds() / 3600 * 3
                 key = re.sub(r'[^a-z0-9]+', '', title.casefold().split(' - ')[0])[:100]
-                row = {'title': title, 'url': link, 'source': source,
-                       'when': when, 'category': category, 'points': points}
+                row = dict(title=title, url=link, source=source, when=when,
+                           category=category, points=points, direction=news_direction(title))
                 if key not in found or points > found[key]['points']:
                     found[key] = row
         except Exception:
@@ -290,36 +288,102 @@ def load_news():
     return chosen
 
 
-def calc_score(quotes):
-    lookup = {name: (symbol, quotes.get(symbol)) for name, _, symbol in ASSETS}
-    def signal(name, inverse=False):
-        symbol, q = lookup[name]
-        if not freshness(q, symbol):
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_qqq_weights():
+    """Fonte opcional; sem dados verificáveis mantém pesos antigos rotulados."""
+    try:
+        holdings = yf.Ticker('QQQ').funds_data.top_holdings
+        if not isinstance(holdings, pd.DataFrame) or holdings.empty:
             return None
-        # 2% = intensidade máxima de referência. Parâmetro experimental.
+        # yfinance costuma retornar símbolos no índice e coluna 'Holding Percent'.
+        col = next((c for c in holdings.columns if str(c).casefold() in
+                    ('holding percent', 'holding_percent', 'weight')), None)
+        if col is None:
+            return None
+        result = {}
+        for sym, _, _ in STOCKS:
+            if sym not in holdings.index:
+                return None
+            val = float(holdings.loc[sym, col])
+            if not np.isfinite(val) or val <= 0:
+                return None
+            result[sym] = val * 100 if val <= 1 else val
+        if not all(0 < x < 30 for x in result.values()):
+            return None
+        # A API não garante data da composição; evitar rotular como peso atual confirmado.
+        return result
+    except Exception:
+        return None
+
+
+def calc_score(quotes, now, weights):
+    lookup = {name: (symbol, quotes.get(symbol)) for name, _, symbol in ASSETS}
+    def signal(name, mode, inverse=False):
+        symbol, q = lookup[name]
+        if quote_status(q, symbol, now) != mode:
+            return None
         value = float(np.clip(q['pct'] / 2.0, -1, 1))
         return -value if inverse else value
 
-    stocks = [(float(np.clip(quotes[sym]['pct'] / 2.0, -1, 1)), weight)
-              for sym, _, weight in STOCKS if freshness(quotes.get(sym), sym)]
-    stocks_value = (sum(v * w for v, w in stocks) / sum(w for _, w in stocks)) if stocks else None
-    tech_parts = [(signal('SOX'), .50), (signal('XLK'), .25), (stocks_value, .25)]
-    available_tech = [(v, w) for v, w in tech_parts if v is not None]
-    tech = (sum(v * w for v, w in available_tech) / sum(w for _, w in available_tech)) if available_tech else None
     def average(*values):
         available = [v for v in values if v is not None]
         return float(np.mean(available)) if available else None
-    groups = {
-        'mercado': signal('ES'),
-        'tecnologia': tech,
-        'juros_dolar': average(signal('US10Y', True), signal('DXY', True)),
-        'volatilidade': average(signal('VIX', True), signal('VXN', True)),
-    }
-    valid = {k: v for k, v in groups.items() if v is not None}
-    coverage = sum(GROUP_WEIGHTS[k] for k in valid)
-    # Sem pelo menos 75% de cobertura, não produzimos classificação.
-    score = round(100 * sum(GROUP_WEIGHTS[k] * v for k, v in valid.items()) / coverage) if coverage >= .75 else None
-    return score, coverage, groups
+
+    def calculate(mode):
+        stocks = [(float(np.clip(quotes[sym]['pct'] / 2.0, -1, 1)), weights[sym])
+                  for sym, _, _ in STOCKS if quote_status(quotes.get(sym), sym, now) == mode]
+        stocks_value = (sum(v * w for v, w in stocks) / sum(w for _, w in stocks)) if stocks else None
+        tech_parts = [(signal('SOX', mode), .50), (signal('XLK', mode), .25), (stocks_value, .25)]
+        available_tech = [(v, w) for v, w in tech_parts if v is not None]
+        tech = (sum(v * w for v, w in available_tech) / sum(w for _, w in available_tech)) if available_tech else None
+        groups = {
+            'mercado': signal('ES', mode),
+            'tecnologia': tech,
+            'juros_dolar': average(signal('US10Y', mode, True), signal('DXY', mode, True)),
+            'volatilidade': average(signal('VIX', mode, True), signal('VXN', mode, True)),
+        }
+        valid = {k: v for k, v in groups.items() if v is not None}
+        coverage = sum(GROUP_WEIGHTS[k] for k in valid)
+        score = round(100 * sum(GROUP_WEIGHTS[k] * v for k, v in valid.items()) / coverage) if coverage >= .75 else None
+        return score, coverage, groups
+
+    recent = calculate('recente')
+    if recent[0] is not None:
+        return (*recent, 'recente')
+    # Modo informativo permite fechamento + recente somente quando todos os
+    # ativos que entram no score estão fora das sessões (ex.: fim de semana).
+    if all(not session_open(sym, now) for _, _, sym in ASSETS):
+        # Sem misturar tipos: recálculo com ambos em mesmo snapshot de fechamento.
+        def combine():
+            patched = {}
+            for sym, q in quotes.items():
+                status = quote_status(q, sym, now)
+                if status in ('recente', 'fechamento'):
+                    patched[sym] = q
+            # calc_score interno adaptado: temporariamente avaliar ambos como 'fechamento'
+            # sem mutar objetos cacheados.
+            effective = {}
+            for sym, q in patched.items():
+                effective[sym] = dict(q)
+            return effective
+        usable = combine()
+        def val(sym, inverse=False):
+            q = usable.get(sym)
+            if not q or q.get('pct') is None:
+                return None
+            v = float(np.clip(q['pct'] / 2.0, -1, 1))
+            return -v if inverse else v
+        stocks = [(val(sym), weights[sym]) for sym, _, _ in STOCKS if val(sym) is not None]
+        sv = sum(v*w for v,w in stocks)/sum(w for _,w in stocks) if stocks else None
+        tech = [(v,w) for v,w in [(val('^SOX'),.50),(val('XLK'),.25),(sv,.25)] if v is not None]
+        groups = {'mercado':val('ES=F'), 'tecnologia':sum(v*w for v,w in tech)/sum(w for _,w in tech) if tech else None,
+                  'juros_dolar':average(val('^TNX',True),val('DX-Y.NYB',True)),
+                  'volatilidade':average(val('^VIX',True),val('^VXN',True))}
+        valid = {k:v for k,v in groups.items() if v is not None}
+        coverage = sum(GROUP_WEIGHTS[k] for k in valid)
+        score = round(100*sum(GROUP_WEIGHTS[k]*v for k,v in valid.items())/coverage) if coverage >= .75 else None
+        return score, coverage, groups, 'fechamento'
+    return (*recent, 'insuficiente')
 
 
 def classify(score):
@@ -341,19 +405,21 @@ def sparkline(values, color):
     return f'<svg viewBox="0 0 96 20" width="100%" height="25" aria-hidden="true"><polyline points="{pts}" fill="none" stroke="{color}" stroke-width="1.8"/></svg>'
 
 
-def asset_card(name, subtitle, q, symbol, extra=''):
+def asset_card(name, subtitle, q, symbol, now, extra=''):
     if not q:
         return f'<div class="asset stale"><div class="asset-name">{name}</div><div class="muted">{subtitle}</div><div class="asset-price">Indisponível</div><div class="tiny">Fonte sem dados</div></div>'
     pct = q.get('pct')
     up = pct is not None and pct >= 0
-    status = quote_status(q, symbol)
+    status = quote_status(q, symbol, now)
     valid = status in ('recente', 'fechamento')
     cls = 'stale' if not valid else ('up' if up else 'down')
     color = '#14dc99' if up else '#ff4d72'
     delta = f'{"▲" if up else "▼"} {pct:+.2f}%' if pct is not None else 'Variação indisponível'
     when = q['time'].strftime('%d/%m %H:%M') if q.get('time') else 'Horário indisponível'
-    suffix = (' · ÚLTIMO FECHAMENTO / SCORE INFORMATIVO' if status == 'fechamento'
-              else '' if valid else ' · ATRASADA / NÃO ENTRA NO SCORE')
+    if q.get('daily_fallback'):
+        when = q['time'].strftime('%d/%m') + ' (diária)'
+    suffix = (' · ÚLTIMO FECHAMENTO / INFORMATIVO' if status == 'fechamento'
+              else '' if status == 'recente' else ' · ATRASADA / NÃO ENTRA NO SCORE')
     price = f'{q["price"]:,.2f}'
     return (f'<div class="asset {cls}"><div class="asset-name">{name}</div><div class="muted">{subtitle}{extra}</div>'
             f'<div class="asset-bottom"><span class="asset-price">{price}</span>'
@@ -361,63 +427,74 @@ def asset_card(name, subtitle, q, symbol, extra=''):
             f'{sparkline(q.get("series", []), color)}<div class="tiny">Cotação: {when} BRT{suffix}</div></div>')
 
 
-# Atualização da página; os dados continuam sujeitos à frequência e disponibilidade da fonte.
-st.markdown('<meta http-equiv="refresh" content="60">', unsafe_allow_html=True)
-with st.spinner('Consultando mercado...'):
-    quotes = load_quotes()
-score, coverage, groups = calc_score(quotes)
-using_closes = any(quote_status(quotes.get(sym), sym) == 'fechamento' for _, _, sym in ASSETS)
-classification, status_color = classify(score)
-score_str = f'{score:+d}' if score is not None else '—'
-score_mode = 'LEITURA COM ÚLTIMOS FECHAMENTOS · INFORMATIVA' if using_closes else 'LEITURA COM COTAÇÕES RECENTES'
+@st.fragment(run_every='60s')
+def render_dashboard():
+    now = datetime.now(BRT)
+    with st.spinner('Consultando mercado...'):
+        quotes = load_quotes()
+    dynamic_weights = load_qqq_weights()
+    weights = dynamic_weights or {sym: weight for sym, _, weight in STOCKS}
+    score, coverage, groups, mode = calc_score(quotes, now, weights)
+    classification, status_color = classify(score)
+    score_str = f'{score:+d}' if score is not None else '—'
+    score_mode = ('LEITURA COM ÚLTIMOS FECHAMENTOS · INFORMATIVA' if mode == 'fechamento'
+                  else 'LEITURA COM COTAÇÕES RECENTES' if mode == 'recente'
+                  else 'SEM COBERTURA RECENTE SUFICIENTE')
+    st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 2.8</div>
+    <div class="muted">BRASÍLIA · {now.strftime('%d/%m/%Y %H:%M:%S')} · ↻ 60 SEG</div></div>''', unsafe_allow_html=True)
+    position = 50 if score is None else max(0, min(100, (score + 100) / 2))
+    st.markdown(f'''<div class="summary-grid">
+    <div class="war-panel"><div class="section">CONCLUSÃO PARA O MNQ</div>
+    <div class="status" style="color:{status_color}">{classification}</div>
+    <div class="muted">Leitura intermarket: {score_str}. Cobertura de grupos: {coverage:.0%}.
+    {score_mode}. NQ é referência, não soma. Indicador experimental; não é sinal de entrada.</div></div>
+    <div class="war-panel"><div class="section">WAR SCORE MNQ</div>
+    <div class="status" style="text-align:center">{score_str}</div>
+    <div class="gauge"><div class="gauge-pin" style="left:{position}%"></div></div>
+    <div class="tiny">-100 BAIXA | 0 NEUTRO | +100 ALTA</div></div></div>''', unsafe_allow_html=True)
+    st.markdown('<div class="section">RADAR INTERMARKET · 8 ATIVOS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="asset-grid">' + ''.join(asset_card(name, desc, quotes.get(sym), sym, now) for name, desc, sym in ASSETS) + '</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section">TOP 4 AÇÕES · PESOS DE REFERÊNCIA</div>', unsafe_allow_html=True)
+    if dynamic_weights:
+        st.caption('Pesos indicativos obtidos do provedor de composição do QQQ (data-base não fornecida pela API). Não presumir atualização em tempo real.')
+    else:
+        st.caption('Pesos ilustrativos de referência do QQQ em 13/10/2026; consulta dinâmica indisponível. Confirme a composição antes de operar.')
+    st.markdown('<div class="asset-grid">' + ''.join(asset_card(sym, company, quotes.get(sym), sym, now, f' · peso ref. {weights[sym]:.2f}%') for sym, company, _ in STOCKS) + '</div>', unsafe_allow_html=True)
+    impacts = []
+    for label, group in [('ES', 'mercado'), ('SOX / XLK / AÇÕES', 'tecnologia'), ('US10Y / DXY', 'juros_dolar'), ('VIX / VXN', 'volatilidade')]:
+        value = groups[group]
+        if value is not None:
+            impacts.append((abs(value * GROUP_WEIGHTS[group]), label, value, GROUP_WEIGHTS[group]))
+    impact_html = ''
+    for _, label, value, weight in sorted(impacts, reverse=True):
+        direction = 'FAVORÁVEL' if value >= 0 else 'DESFAVORÁVEL'
+        color = '#14dc99' if value >= 0 else '#ff4d72'
+        impact_html += f'<div class="impact"><b>{label}</b><br><span style="color:{color}">{direction}</span> · peso {weight:.0%}</div>'
+    if not impact_html:
+        impact_html = '<div class="tiny">Sinais atuais indisponíveis.</div>'
+    news = load_news()
+    news_html = ''
+    for i, item in enumerate(news, 1):
+        title = html.escape(item.get('title_pt', item['title']))
+        source = html.escape(item['source'])
+        url = html.escape(item['url'], quote=True)
+        category = html.escape(item['category'])
+        direction = item.get('direction')
+        if direction == 'POSITIVO NASDAQ':
+            tag = '<span class="positive">POSITIVO NASDAQ (manchete)</span>'
+        elif direction == 'NEGATIVO NASDAQ':
+            tag = '<span class="negative">NEGATIVO NASDAQ (manchete)</span>'
+        else:
+            tag = '<span class="tiny">impacto direcional não classificado</span>'
+        news_html += (f'<div class="news"><span class="news-num">{i}</span> '
+                      f'<span class="news-tag">{category}</span><br>'
+                      f'<a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a>'
+                      f'<div class="tiny">{item["when"].strftime("%d/%m %H:%M")} BRT · {source} · {tag}</div></div>')
+    if not news_html:
+        news_html = '<div class="tiny">Nenhuma manchete verificada de fonte financeira e relevância suficiente nas últimas 24h. Não exibimos notícias genéricas para preencher espaço.</div>'
+    st.markdown(f'<div class="war-panel"><div class="section">MAIORES IMPACTOS NO MNQ</div>{impact_html}<div class="tiny">Grupos agregados para reduzir dupla contagem. Pesos experimentais.</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="war-panel"><div class="section">NOTÍCIAS RELEVANTES · TOP 3 POR PRIORIDADE</div>{news_html}</div>', unsafe_allow_html=True)
+    st.markdown('''<div class="war-panel tiny">Cotações: Yahoo Finance (yfinance), sujeitas a atrasos e indisponibilidade. Notícias: Google News RSS, fontes financeiras selecionadas e tradução automática (pode falhar). Direção das notícias: heurística restrita ao movimento explícito descrito na manchete, não é previsão de impacto. Atualização Streamlit a cada 60 segundos enquanto a sessão estiver conectada; fontes possuem cache e atraso próprios. Percentuais contra o último fechamento diário anterior disponível. Leitura de fechamentos somente quando os mercados de referência estão fora da sessão aproximada. Horários de feriados e sessões especiais não são validados. Pesos e escala de intensidade são hipóteses não validadas por backtest; o WAR SCORE não é recomendação nem sinal de entrada.</div>''', unsafe_allow_html=True)
 
-st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 2.7</div>
-<div class="muted">BRASÍLIA · {NOW.strftime('%d/%m/%Y %H:%M:%S')} · ↻ 60 SEG</div></div>''', unsafe_allow_html=True)
-position = 50 if score is None else (score + 100) / 2
-st.markdown(f'''<div class="summary-grid">
-<div class="war-panel"><div class="section">CONCLUSÃO PARA O MNQ</div>
-<div class="status" style="color:{status_color}">{classification}</div>
-<div class="muted">Leitura intermarket: {score_str}. Cobertura de grupos: {coverage:.0%}.
-{score_mode}. NQ é referência, não soma. Indicador experimental; não é sinal de entrada.</div></div>
-<div class="war-panel"><div class="section">WAR SCORE MNQ</div>
-<div class="status" style="text-align:center">{score_str}</div>
-<div class="gauge"><div class="gauge-pin" style="left:{position}%"></div></div>
-<div class="tiny">-100 BAIXA | 0 NEUTRO | +100 ALTA</div></div></div>''', unsafe_allow_html=True)
 
-st.markdown('<div class="section">RADAR INTERMARKET · 8 ATIVOS</div>', unsafe_allow_html=True)
-st.markdown('<div class="asset-grid">' + ''.join(asset_card(name, desc, quotes.get(sym), sym) for name, desc, sym in ASSETS) + '</div>', unsafe_allow_html=True)
-st.markdown('<div class="section">TOP 4 AÇÕES · PESOS DE REFERÊNCIA</div>', unsafe_allow_html=True)
-st.caption('Pesos ilustrativos de referência do QQQ em 13/10/2026; não atualizados automaticamente. Confirme a composição antes de operar.')
-st.markdown('<div class="asset-grid">' + ''.join(asset_card(sym, company, quotes.get(sym), sym, f' · peso ref. {weight:.2f}%') for sym, company, weight in STOCKS) + '</div>', unsafe_allow_html=True)
-
-impacts = []
-for label, group in [('ES', 'mercado'), ('SOX / XLK / AÇÕES', 'tecnologia'), ('US10Y / DXY', 'juros_dolar'), ('VIX / VXN', 'volatilidade')]:
-    value = groups[group]
-    if value is not None:
-        impacts.append((abs(value * GROUP_WEIGHTS[group]), label, value, GROUP_WEIGHTS[group]))
-impact_html = ''
-for _, label, value, weight in sorted(impacts, reverse=True):
-    direction = 'FAVORÁVEL' if value >= 0 else 'DESFAVORÁVEL'
-    color = '#14dc99' if value >= 0 else '#ff4d72'
-    impact_html += f'<div class="impact"><b>{label}</b><br><span style="color:{color}">{direction}</span> · peso {weight:.0%}</div>'
-if not impact_html:
-    impact_html = '<div class="tiny">Sinais atuais indisponíveis.</div>'
-
-news = load_news()
-news_html = ''
-for i, item in enumerate(news, 1):
-    title = html.escape(item.get('title_pt', item['title']))
-    source = html.escape(item['source'])
-    url = html.escape(item['url'], quote=True)
-    category = html.escape(item['category'])
-    news_html += (f'<div class="news"><span class="news-num">{i}</span> '
-                  f'<span class="news-tag">{category}</span><br>'
-                  f'<a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a>'
-                  f'<div class="tiny">{item["when"].strftime("%d/%m %H:%M")} BRT · {source} · impacto direcional não classificado</div></div>')
-if not news_html:
-    news_html = '<div class="tiny">Nenhuma manchete verificada de fonte financeira e relevância suficiente nas últimas 24h. Não exibimos notícias genéricas para preencher espaço.</div>'
-
-# Quadros propositalmente EMPILHADOS, inclusive em telas grandes.
-st.markdown(f'<div class="war-panel"><div class="section">MAIORES IMPACTOS NO MNQ</div>{impact_html}<div class="tiny">Grupos agregados para reduzir dupla contagem. Pesos experimentais.</div></div>', unsafe_allow_html=True)
-st.markdown(f'<div class="war-panel"><div class="section">NOTÍCIAS RELEVANTES · TOP 3 POR PRIORIDADE</div>{news_html}</div>', unsafe_allow_html=True)
-st.markdown('''<div class="war-panel tiny">Cotações: Yahoo Finance (yfinance), sujeitas a atrasos e indisponibilidade. Notícias: Google News RSS, fontes financeiras selecionadas e tradução automática (pode falhar); classificação heurística sem leitura do conteúdo integral. Atualização da página a cada 60 segundos, quando o navegador permitir. Percentuais contra o último fechamento diário anterior disponível. Com mercado fechado, últimos preços disponíveis (até 7 dias) podem compor SCORE INFORMATIVO; dados antigos durante mercado aberto são excluídos. Feriados e horários especiais podem exigir revisão. Pesos, sinais inversos e escala de intensidade são hipóteses não validadas por backtest; o WAR SCORE não é recomendação nem sinal de entrada.</div>''', unsafe_allow_html=True)
+render_dashboard()
