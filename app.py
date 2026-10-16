@@ -11,7 +11,7 @@ from email.utils import parsedate_to_datetime
 import html
 import re
 
-st.set_page_config(page_title='WAR TRADING — LIVE MARKET 3.0', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='WAR TRADING — LIVE MARKET 3.1', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
 BRT = ZoneInfo('America/Sao_Paulo')
 NY = ZoneInfo('America/New_York')
 STOCKS = [('NVDA', 'Nvidia', 8.31), ('AAPL', 'Apple', 7.51), ('MSFT', 'Microsoft', 6.09), ('MU', 'Micron', 4.48)]
@@ -21,7 +21,14 @@ ASSETS = [('NQ', 'Nasdaq Futuro', 'NQ=F'), ('ES', 'S&P 500 Futuro', 'ES=F'),
           ('VXN', 'Volatilidade Nasdaq', '^VXN'), ('XLK', 'ETF Tecnologia', 'XLK')]
 GROUP_WEIGHTS = {'mercado': .30, 'tecnologia': .25, 'juros_dolar': .25, 'volatilidade': .20}
 FUTURES = {'NQ=F', 'ES=F'}
-CASH_SYMBOLS = {'^SOX', '^TNX', '^VIX', '^VXN', 'XLK', 'NVDA', 'AAPL', 'MSFT', 'MU'}
+GROUP_COMPONENTS = {
+    'mercado': [('ES', 'ES=F')],
+    'tecnologia': [('SOX', '^SOX'), ('XLK', 'XLK'), ('NVDA', 'NVDA'), ('AAPL', 'AAPL'), ('MSFT', 'MSFT'), ('MU', 'MU')],
+    'juros_dolar': [('US10Y', '^TNX'), ('DXY', 'DX-Y.NYB')],
+    'volatilidade': [('VIX', '^VIX'), ('VXN', '^VXN')],
+}
+GROUP_NAMES = {'mercado': 'ES', 'tecnologia': 'SOX / XLK / AÇÕES', 'juros_dolar': 'US10Y / DXY', 'volatilidade': 'VIX / VXN'}
+STATUS_NAMES = {'recente': 'recente', 'fechamento': 'último fechamento', 'obsoleta': 'atrasada', 'sem_referencia': 'sem referência de variação'}
 
 st.markdown('''<style>
 #MainMenu, footer {visibility:hidden}
@@ -81,6 +88,10 @@ def cleaned_close(frame):
     return values.replace([np.inf, -np.inf], np.nan).dropna().loc[lambda x: x > 0]
 
 
+def day_of(idx):
+    return pd.Timestamp(idx).date()
+
+
 @st.cache_data(ttl=55, show_spinner=False)
 def load_quotes():
     symbols = list(dict.fromkeys([a[2] for a in ASSETS] + [s[0] for s in STOCKS]))
@@ -99,44 +110,49 @@ def load_quotes():
         try:
             i = cleaned_close(part_for(intraday, sym))
             d = cleaned_close(part_for(daily, sym))
-            daily_fallback = i.empty
+            intraday_data = None
             if not i.empty:
                 timestamp = pd.Timestamp(i.index[-1])
-                if timestamp.tzinfo is None:
-                    continue  # Não inventar fuso de barras intradiárias.
-                stamp = timestamp.tz_convert(BRT).to_pydatetime()
-                price = float(i.iloc[-1])
-                series = i.tail(32).tolist()
-            elif not d.empty:
-                # Data diária sem hora real: NÃO afirmar que o fechamento foi às 17h.
-                day = pd.Timestamp(d.index[-1]).date()
-                stamp = datetime.combine(day, time(0, 0), tzinfo=BRT)
-                price = float(d.iloc[-1])
-                series = d.tail(32).tolist()
-            else:
-                continue
-            reference = None
-            reference_date = None
-            # Barras diárias podem incluir dia atual parcial; usar apenas dia anterior.
-            if not daily_fallback:
-                candidates = [(pd.Timestamp(idx).date(), float(v)) for idx, v in d.items()
-                              if pd.Timestamp(idx).date() < stamp.date()]
-            else:
-                candidates = [(pd.Timestamp(idx).date(), float(v)) for idx, v in d.iloc[:-1].items()]
-            if candidates:
-                reference_date, reference = candidates[-1]
-            pct = None
-            if reference and reference > 0 and (stamp.date() - reference_date).days <= 5:
-                pct = (price / reference - 1) * 100
-            out[sym] = dict(price=price, time=stamp, series=series, pct=pct,
-                            reference_date=reference_date, daily_fallback=daily_fallback)
+                if timestamp.tzinfo is not None:
+                    stamp = timestamp.tz_convert(BRT).to_pydatetime()
+                    price = float(i.iloc[-1])
+                    candidates = [(day_of(idx), float(v)) for idx, v in d.items() if day_of(idx) < stamp.date()]
+                    if candidates:
+                        ref_date, reference = candidates[-1]
+                        if 0 <= (stamp.date() - ref_date).days <= 5 and reference > 0:
+                            intraday_data = dict(price=price, time=stamp, series=i.tail(32).tolist(),
+                                                 pct=(price / reference - 1) * 100, reference_date=ref_date,
+                                                 daily_fallback=False, session_date=stamp.astimezone(NY).date())
+            # Historical close is independent of the last intraday tick. This prevents
+            # a partial or old intraday bar from being treated as today's close.
+            historical = None
+            if len(d) >= 2:
+                # Use the last daily row only when it is for a prior NY date.
+                # On today's date the row may still be an unfinished candle.
+                today_ny = datetime.now(NY).date()
+                eligible = [(day_of(idx), float(v)) for idx, v in d.items() if day_of(idx) < today_ny]
+                if len(eligible) >= 2:
+                    close_date, close_price = eligible[-1]
+                    ref_date, ref_price = eligible[-2]
+                    if ref_price > 0 and (close_date - ref_date).days <= 5:
+                        historical = dict(price=close_price, time=datetime.combine(close_date, time(0), tzinfo=NY).astimezone(BRT),
+                                          series=d.tail(32).tolist(), pct=(close_price / ref_price - 1) * 100,
+                                          reference_date=ref_date, daily_fallback=True, session_date=close_date)
+            # When the market has ended today, a recent intraday observation can
+            # serve as a closing snapshot; it is NOT labelled an official close.
+            if intraday_data is not None:
+                out[sym] = intraday_data
+            elif historical is not None:
+                out[sym] = historical
+            if sym in out:
+                out[sym]['historical'] = historical
         except Exception:
             continue
     return out
 
 
 def session_open(symbol, now):
-    """Aproximação das sessões NY; não é calendário de feriados da bolsa."""
+    """Approximate regular sessions; holidays and early closes not verified."""
     ny = now.astimezone(NY)
     day, minute = ny.weekday(), ny.hour * 60 + ny.minute
     if symbol in FUTURES:
@@ -144,7 +160,7 @@ def session_open(symbol, now):
                 (day in (0, 1, 2, 3) and not (17 * 60 <= minute < 18 * 60)) or
                 (day == 4 and minute < 17 * 60))
     if symbol == 'DX-Y.NYB':
-        return day < 5  # Horários específicos do DXY variam por fornecedor.
+        return day < 5  # Provider-dependent schedule.
     return day < 5 and 9 * 60 + 30 <= minute < 16 * 60
 
 
@@ -155,8 +171,7 @@ def quote_status(q, symbol, now):
     if age < timedelta(minutes=-5):
         return 'obsoleta'
     if q.get('daily_fallback'):
-        # Fechamento diário não possui timestamp intradiário confiável.
-        return 'fechamento' if not session_open(symbol, now) and age <= timedelta(days=4) else 'obsoleta'
+        return 'fechamento' if age <= timedelta(days=5) else 'obsoleta'
     limit = timedelta(minutes=20) if symbol in FUTURES or symbol == 'DX-Y.NYB' else timedelta(minutes=25)
     if age <= limit and session_open(symbol, now):
         return 'recente'
@@ -165,78 +180,63 @@ def quote_status(q, symbol, now):
     return 'obsoleta'
 
 
+def historical_quote(q, symbol, now):
+    """Return an explicitly dated historical snapshot, never as live data."""
+    if not q:
+        return None
+    if q.get('daily_fallback'):
+        return q if quote_status(q, symbol, now) == 'fechamento' else None
+    # Prefer completed daily bars for a common-date historical snapshot.
+    # A late intraday tick is not an official settlement price.
+    historical = q.get('historical')
+    if historical is not None:
+        return historical
+    if not session_open(symbol, now) and quote_status(q, symbol, now) == 'fechamento':
+        return q
+    return None
+
+
 def score_news_title(title):
-    """Seleciona eventos econômicos e notícias de mercado, não páginas de instrumentos."""
     t = title.casefold()
-    blocked = (
-        'option chain', 'options chain', 'option quotes', 'options quotes',
-        'total return index', 'historical data', 'historical prices',
-        'stock quote', 'stock price history', 'real-time quote', 'realtime quote',
-        'market cap', 'dividend history', 'technical analysis', 'price target',
-        'analyst rating', 'insider sells', 'insider buys', 'shares sold',
-        'shares bought', 'class action', 'lawsuit filed', 'earnings calendar',
-        'economic calendar', 'etf holdings', 'index methodology',
-        'utility rate', 'electric rate', 'water rate', 'insurance rate',
-        'rate hike for', 'rate hike on', 'rate increase for', 'rate increase on',
-        'local jobs report', 'state releases', 'school', 'county', 'city council',
-        'ballroom', 'wedding', 'celebrity', 'football', 'soccer',
-        'how to buy', 'should you buy', 'best stocks to buy', 'stock forecast',
-        'what is', 'explained:', 'price prediction', 'investing guide',
-    )
+    blocked = ('option chain', 'options chain', 'option quotes', 'options quotes', 'total return index',
+               'historical data', 'historical prices', 'stock quote', 'stock price history',
+               'real-time quote', 'realtime quote', 'market cap', 'dividend history',
+               'technical analysis', 'price target', 'analyst rating', 'insider sells',
+               'insider buys', 'shares sold', 'shares bought', 'class action', 'lawsuit filed',
+               'earnings calendar', 'economic calendar', 'etf holdings', 'index methodology',
+               'utility rate', 'electric rate', 'water rate', 'insurance rate', 'rate hike for',
+               'rate hike on', 'rate increase for', 'rate increase on', 'local jobs report',
+               'state releases', 'school', 'county', 'city council', 'ballroom', 'wedding',
+               'celebrity', 'football', 'soccer', 'how to buy', 'should you buy',
+               'best stocks to buy', 'stock forecast', 'what is', 'explained:',
+               'price prediction', 'investing guide')
     if any(phrase in t for phrase in blocked):
         return None
     categories = [
-        ('FED / JUROS', 14, ('federal reserve', 'fomc', 'fed chair',
-            'fed governor', 'fed officials', 'fed rate', 'fed cuts',
-            'fed hikes', 'powell says', 'fed president', 'interest rate decision')),
-        ('INFLAÇÃO / EMPREGO', 14, ('us cpi', 'u.s. cpi', 'consumer price index',
-            'core pce', 'pce inflation', 'us payrolls', 'nonfarm payroll',
-            'us jobs report', 'u.s. jobs report', 'us unemployment',
-            'producer price index', 'us inflation', 'u.s. inflation')),
-        ('TREASURIES / DÓLAR', 11, ('treasury yields', 'treasury yield',
-            '10-year yield', 'us 10-year', 'u.s. 10-year', 'dollar index', 'dxy')),
-        ('NASDAQ / MERCADO', 12, ('nasdaq 100', 'nasdaq-100', 'nasdaq futures',
-            'nasdaq composite', 'wall street stocks', 's&p 500 futures',
-            'us stock futures', 'u.s. stock futures', 'wall street falls',
-            'wall street rises', 'wall street rallies', 'wall street slides')),
-        ('BALANÇOS BIG TECH', 12, ('nvidia earnings', 'microsoft earnings',
-            'apple earnings', 'amazon earnings', 'alphabet earnings',
-            'meta earnings', 'tesla earnings', 'micron earnings',
-            'broadcom earnings', 'nvidia results', 'microsoft results',
-            'apple results', 'amazon results', 'alphabet results')),
-        ('SEMICONDUTORES / IA', 10, ('semiconductor stocks', 'chip stocks',
-            'ai chip', 'semiconductor export', 'chip export restrictions',
-            'nvidia ai chips', 'chipmakers', 'semiconductor tariffs')),
+        ('FED / JUROS', 14, ('federal reserve', 'fomc', 'fed chair', 'fed governor', 'fed officials', 'fed rate', 'fed cuts', 'fed hikes', 'powell says', 'fed president', 'interest rate decision')),
+        ('INFLAÇÃO / EMPREGO', 14, ('us cpi', 'u.s. cpi', 'consumer price index', 'core pce', 'pce inflation', 'us payrolls', 'nonfarm payroll', 'us jobs report', 'u.s. jobs report', 'us unemployment', 'producer price index', 'us inflation', 'u.s. inflation')),
+        ('TREASURIES / DÓLAR', 11, ('treasury yields', 'treasury yield', '10-year yield', 'us 10-year', 'u.s. 10-year', 'dollar index', 'dxy')),
+        ('NASDAQ / MERCADO', 12, ('nasdaq 100', 'nasdaq-100', 'nasdaq futures', 'nasdaq composite', 'wall street stocks', 's&p 500 futures', 'us stock futures', 'u.s. stock futures', 'wall street falls', 'wall street rises', 'wall street rallies', 'wall street slides')),
+        ('BALANÇOS BIG TECH', 12, ('nvidia earnings', 'microsoft earnings', 'apple earnings', 'amazon earnings', 'alphabet earnings', 'meta earnings', 'tesla earnings', 'micron earnings', 'broadcom earnings', 'nvidia results', 'microsoft results', 'apple results', 'amazon results', 'alphabet results')),
+        ('SEMICONDUTORES / IA', 10, ('semiconductor stocks', 'chip stocks', 'ai chip', 'semiconductor export', 'chip export restrictions', 'nvidia ai chips', 'chipmakers', 'semiconductor tariffs')),
     ]
-    hits = [(weight, category) for category, weight, phrases in categories
-            if any(phrase in t for phrase in phrases)]
+    hits = [(weight, category) for category, weight, phrases in categories if any(phrase in t for phrase in phrases)]
     if not hits:
         return None
-    # A menção a um índice, isoladamente, não constitui uma notícia.
     category = max(hits)[1]
     if category == 'NASDAQ / MERCADO':
-        event_words = (r'\b(fall|falls|fell|drop|drops|dropped|slide|slides|'
-                       r'rise|rises|rose|gain|gains|gained|rally|rallies|'
-                       r'jump|jumps|surge|surges|slump|slumps|sink|sinks|'
-                       r'tumble|tumbles|plunge|plunges|rebound|rebounds|'
-                       r'flat|steady|mixed|slip|slips|dip|dips|retreat|'
-                       r'climb|climbs|edge|edges|trade|trades|trading|'
-                       r'open|opens|close|closes|futures|selloff|sell-off)\b')
+        event_words = (r'\b(fall|falls|fell|drop|drops|dropped|slide|slides|rise|rises|rose|gain|gains|gained|rally|rallies|jump|jumps|surge|surges|slump|slumps|sink|sinks|tumble|tumbles|plunge|plunges|rebound|rebounds|flat|steady|mixed|slip|slips|dip|dips|retreat|climb|climbs|edge|edges|trade|trades|trading|open|opens|close|closes|futures|selloff|sell-off)\b')
         if not re.search(event_words, t):
             return None
     return max(hits)
 
 
 def news_direction(title):
-    """Rotula movimento observado do Nasdaq, sem prever reação a eventos macro."""
     t = title.casefold()
-    # Exige que a manchete trate do mercado de ações, não de outro ativo.
     if not re.search(r'\b(nasdaq|s&p 500|stock futures|stocks|wall street)\b', t):
         return None
-    up = bool(re.search(r'\b(rise|rises|rose|gain|gains|gained|rally|rallies|'
-                        r'jump|jumps|surge|surges|rebound|rebounds|climb|climbs)\b', t))
-    down = bool(re.search(r'\b(fall|falls|fell|drop|drops|dropped|slide|slides|'
-                          r'slump|slumps|sink|sinks|tumble|tumbles|plunge|plunges)\b', t))
+    up = bool(re.search(r'\b(rise|rises|rose|gain|gains|gained|rally|rallies|jump|jumps|surge|surges|rebound|rebounds|climb|climbs)\b', t))
+    down = bool(re.search(r'\b(fall|falls|fell|drop|drops|dropped|slide|slides|slump|slumps|sink|sinks|tumble|tumbles|plunge|plunges)\b', t))
     if up == down:
         return None
     return 'POSITIVO NASDAQ' if up else 'NEGATIVO NASDAQ'
@@ -266,10 +266,9 @@ def load_news():
         '("Nvidia earnings" OR "Microsoft earnings" OR "Apple earnings" OR "Amazon earnings" OR "Meta earnings") when:1d',
         '("semiconductor stocks" OR "AI chips" OR "chip export restrictions") when:1d',
     ]
-    allowed = ('reuters', 'bloomberg', 'cnbc', 'associated press', 'ap news',
-               'marketwatch', 'yahoo finance', 'financial times', 'barron',
-               'wall street journal', 'investing.com', 'the economist',
-               'the guardian', 'fortune', 'business insider')
+    allowed = ('reuters', 'bloomberg', 'cnbc', 'associated press', 'ap news', 'marketwatch',
+               'yahoo finance', 'financial times', 'barron', 'wall street journal',
+               'investing.com', 'the economist', 'the guardian', 'fortune', 'business insider')
     found = {}
     for query in searches:
         url = f'https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en'
@@ -294,7 +293,6 @@ def load_news():
                 if ranked is None:
                     continue
                 priority, category = ranked
-                # Penalidade moderada por idade; macro tem prioridade sobre manchetes genéricas.
                 points = priority * 100 - age.total_seconds() / 3600 * 9
                 if category == 'NASDAQ / MERCADO':
                     points -= age.total_seconds() / 3600 * 16
@@ -308,9 +306,9 @@ def load_news():
             continue
     ordered = sorted(found.values(), key=lambda n: (n['points'], n['when']), reverse=True)
     chosen, counts, event_keys = [], {}, set()
-    stop = {'stocks', 'stock', 'market', 'markets', 'nasdaq', 'futures',
-            'today', 'after', 'amid', 'says', 'said', 'rates', 'rate',
-            'federal', 'reserve', 'wall', 'street', 'shares', 'the', 'with'}
+    stop = {'stocks', 'stock', 'market', 'markets', 'nasdaq', 'futures', 'today',
+            'after', 'amid', 'says', 'said', 'rates', 'rate', 'federal',
+            'reserve', 'wall', 'street', 'shares', 'the', 'with'}
 
     def story_tokens(item):
         title = re.sub(r'\s+-\s+[^-]+$', '', item['title'].casefold())
@@ -319,8 +317,6 @@ def load_news():
     def event_key(item):
         t = item['title'].casefold()
         if item['category'] == 'FED / JUROS':
-            # Declarações de um mesmo dirigente e expectativas da mesma reunião
-            # não devem monopolizar o Top 3.
             if any(w in t for w in ('warsh', 'powell', 'fed chair', 'fed president')):
                 return 'fed_discurso_' + next((w for w in ('warsh', 'powell') if w in t), 'dirigente')
             if any(w in t for w in ('hold', 'holding', 'unchanged', 'pause', 'cut', 'hike')):
@@ -338,19 +334,16 @@ def load_news():
     for item in ordered:
         category = item['category']
         if counts.get(category, 0) >= 1:
-            continue  # eventos distintos: no máximo uma notícia por categoria
+            continue
         key = event_key(item)
         if key and key in event_keys:
             continue
         tokens = story_tokens(item)
-        duplicate = any(
-            len(tokens & story_tokens(old)) >= 3 and
-            len(tokens & story_tokens(old)) / max(1, min(len(tokens), len(story_tokens(old)))) >= .55
-            for old in chosen
-        )
+        duplicate = any(len(tokens & story_tokens(old)) >= 3 and
+                        len(tokens & story_tokens(old)) / max(1, min(len(tokens), len(story_tokens(old)))) >= .55
+                        for old in chosen)
         if duplicate:
             continue
-        # Notícia de pré-mercado perde prioridade após o início da sessão NY.
         ny = now.astimezone(NY)
         if key == 'mercado_premarket' and ny.hour >= 12:
             continue
@@ -367,12 +360,10 @@ def load_news():
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_qqq_weights():
-    """Fonte opcional; sem dados verificáveis mantém pesos antigos rotulados."""
     try:
         holdings = yf.Ticker('QQQ').funds_data.top_holdings
         if not isinstance(holdings, pd.DataFrame) or holdings.empty:
             return None
-        # yfinance costuma retornar símbolos no índice e coluna 'Holding Percent'.
         col = next((c for c in holdings.columns if str(c).casefold() in
                     ('holding percent', 'holding_percent', 'weight')), None)
         if col is None:
@@ -385,94 +376,93 @@ def load_qqq_weights():
             if not np.isfinite(val) or val <= 0:
                 return None
             result[sym] = val * 100 if val <= 1 else val
-        if not all(0 < x < 30 for x in result.values()):
-            return None
-        # A API não garante data da composição; evitar rotular como peso atual confirmado.
-        return result
+        return result if all(0 < x < 30 for x in result.values()) else None
     except Exception:
         return None
 
 
-GROUP_COMPONENTS = {
-    'mercado': [('ES', 'ES=F')],
-    'tecnologia': [('SOX', '^SOX'), ('XLK', 'XLK'),
-                   ('NVDA', 'NVDA'), ('AAPL', 'AAPL'), ('MSFT', 'MSFT'), ('MU', 'MU')],
-    'juros_dolar': [('US10Y', '^TNX'), ('DXY', 'DX-Y.NYB')],
-    'volatilidade': [('VIX', '^VIX'), ('VXN', '^VXN')],
-}
-GROUP_NAMES = {
-    'mercado': 'ES', 'tecnologia': 'SOX / XLK / AÇÕES',
-    'juros_dolar': 'US10Y / DXY', 'volatilidade': 'VIX / VXN',
-}
-STATUS_NAMES = {
-    'recente': 'recente', 'fechamento': 'último fechamento',
-    'obsoleta': 'atrasada', 'sem_referencia': 'sem referência de variação',
-}
-
-
 def calc_score(quotes, now, weights):
-    """Devolve pontuação, cobertura, grupos, modo e auditoria de cada grupo.
+    """LIVE requires fresh ticks. Historical uses a common NY trading date,
+    never combining different dates or presenting an old score as LIVE."""
+    live = {}
+    historic = {}
+    for _, members in GROUP_COMPONENTS.items():
+        for _, sym in members:
+            q = quotes.get(sym)
+            if quote_status(q, sym, now) == 'recente':
+                live[sym] = q
+            h = historical_quote(q, sym, now)
+            if h and h.get('pct') is not None and h.get('session_date') is not None:
+                historic[sym] = h
 
-    Fora das sessões usa apenas fechamentos identificados. Em horário misto
-    utiliza somente dados recentes; não mistura fechamento com intraday.
-    """
-    market_off = all(not session_open(sym, now) for _, _, sym in ASSETS)
-    mode = 'fechamento' if market_off else 'recente'
+    def compute(selected, mode):
+        def signal(sym, inverse=False):
+            q = selected.get(sym)
+            if not q or q.get('pct') is None:
+                return None
+            return float(np.clip(q['pct'] / 2.0, -1, 1)) * (-1 if inverse else 1)
 
-    def signal(sym, inverse=False):
-        q = quotes.get(sym)
-        status = quote_status(q, sym, now)
-        permitted = ('recente', 'fechamento') if market_off else ('recente',)
-        if status not in permitted:
-            return None
-        return float(np.clip(q['pct'] / 2.0, -1, 1)) * (-1 if inverse else 1)
+        def average(*values):
+            vals = [v for v in values if v is not None]
+            return float(np.mean(vals)) if vals else None
 
-    def average(*values):
-        vals = [v for v in values if v is not None]
-        return float(np.mean(vals)) if vals else None
+        available_stocks = [(signal(sym), weights.get(sym, ref)) for sym, _, ref in STOCKS]
+        available_stocks = [(v, w) for v, w in available_stocks if v is not None and w > 0]
+        stocks_value = (sum(v * w for v, w in available_stocks) / sum(w for _, w in available_stocks)) if available_stocks else None
+        tech_parts = [(signal('^SOX'), .50), (signal('XLK'), .25), (stocks_value, .25)]
+        tech_parts = [(v, w) for v, w in tech_parts if v is not None]
+        tech = sum(v * w for v, w in tech_parts) / sum(w for _, w in tech_parts) if tech_parts else None
+        groups = {'mercado': signal('ES=F'), 'tecnologia': tech,
+                  'juros_dolar': average(signal('^TNX', True), signal('DX-Y.NYB', True)),
+                  'volatilidade': average(signal('^VIX', True), signal('^VXN', True))}
+        coverage = sum(GROUP_WEIGHTS[k] for k, v in groups.items() if v is not None)
+        score = round(100 * sum(GROUP_WEIGHTS[k] * v for k, v in groups.items() if v is not None) / coverage) if coverage >= .75 else None
+        details = {}
+        for key, members in GROUP_COMPONENTS.items():
+            used, excluded = [], []
+            for name, sym in members:
+                if sym in selected:
+                    used.append(name + (' (hist.)' if mode == 'fechamento' else ''))
+                else:
+                    status = quote_status(quotes.get(sym), sym, now)
+                    excluded.append(f'{name}: {STATUS_NAMES.get(status, status)}')
+            details[key] = {'used': used, 'excluded': excluded, 'value': groups[key], 'weight': GROUP_WEIGHTS[key]}
+        return score, coverage, groups, details
 
-    available_stocks = [(signal(sym), weights.get(sym, ref)) for sym, _, ref in STOCKS]
-    available_stocks = [(v, w) for v, w in available_stocks if v is not None and w > 0]
-    stocks_value = (sum(v*w for v, w in available_stocks) /
-                    sum(w for _, w in available_stocks)) if available_stocks else None
-    tech_parts = [(signal('^SOX'), .50), (signal('XLK'), .25), (stocks_value, .25)]
-    tech_parts = [(v, w) for v, w in tech_parts if v is not None]
-    tech = sum(v*w for v, w in tech_parts)/sum(w for _, w in tech_parts) if tech_parts else None
-    groups = {
-        'mercado': signal('ES=F'),
-        'tecnologia': tech,
-        'juros_dolar': average(signal('^TNX', True), signal('DX-Y.NYB', True)),
-        'volatilidade': average(signal('^VIX', True), signal('^VXN', True)),
-    }
-    coverage = sum(GROUP_WEIGHTS[k] for k, v in groups.items() if v is not None)
-    score = (round(100 * sum(GROUP_WEIGHTS[k] * v for k, v in groups.items()
-                             if v is not None) / coverage) if coverage >= .75 else None)
-    details = {}
-    for key, members in GROUP_COMPONENTS.items():
-        used, excluded = [], []
-        for name, sym in members:
-            status = quote_status(quotes.get(sym), sym, now)
-            allowed = status in (('recente', 'fechamento') if market_off else ('recente',))
-            if allowed:
-                used.append(name + (' (fech.)' if status == 'fechamento' else ''))
-            else:
-                excluded.append(f'{name}: {STATUS_NAMES.get(status, status)}')
-        details[key] = {'used': used, 'excluded': excluded,
-                        'value': groups[key], 'weight': GROUP_WEIGHTS[key]}
-    return score, coverage, groups, mode, details
+    live_result = compute(live, 'recente')
+    if live_result[0] is not None:
+        return (*live_result[:3], 'recente', live_result[3], None)
+
+    # Historical snapshot: group all components by the same NY session date.
+    # Choose the most recent date with >=75% weighted coverage, within 5 days.
+    dates = sorted({q['session_date'] for q in historic.values()}, reverse=True)
+    for date in dates:
+        if not (0 <= (now.astimezone(NY).date() - date).days <= 5):
+            continue
+        selected = {sym: q for sym, q in historic.items() if q['session_date'] == date}
+        result = compute(selected, 'fechamento')
+        if result[0] is not None:
+            return (*result[:3], 'fechamento', result[3], date)
+    return (*live_result[:3], 'indisponivel', live_result[3], None)
 
 
 def classify(score):
-    if score is None: return ('DADOS INSUFICIENTES', '#a4b6c8')
-    if score <= -60: return ('BAIXA FORTE', '#ff4265')
-    if score <= -20: return ('BAIXA MODERADA', '#ff8761')
-    if score < 20: return ('LATERALIZAÇÃO', '#ffd25b')
-    if score < 60: return ('ALTA MODERADA', '#15d99b')
+    if score is None:
+        return ('DADOS INSUFICIENTES', '#a4b6c8')
+    if score <= -60:
+        return ('BAIXA FORTE', '#ff4265')
+    if score <= -20:
+        return ('BAIXA MODERADA', '#ff8761')
+    if score < 20:
+        return ('LATERALIZAÇÃO', '#ffd25b')
+    if score < 60:
+        return ('ALTA MODERADA', '#15d99b')
     return ('ALTA FORTE', '#15d99b')
 
 
 def sparkline(values, color):
-    if len(values) < 2: return ''
+    if len(values) < 2:
+        return ''
     arr = np.asarray(values, dtype=float)
     lo, hi = float(np.min(arr)), float(np.max(arr))
     y = 16 - (arr - lo) / (hi - lo if hi != lo else 1) * 13
@@ -495,7 +485,7 @@ def asset_card(name, subtitle, q, symbol, now, extra=''):
     if q.get('daily_fallback'):
         when = q['time'].strftime('%d/%m') + ' (diária)'
     suffix = (' · ÚLTIMO FECHAMENTO / INFORMATIVO' if status == 'fechamento'
-              else '' if status == 'recente' else ' · ATRASADA / NÃO ENTRA NO SCORE')
+              else '' if status == 'recente' else ' · ATRASADA / NÃO ENTRA NO LIVE')
     price = f'{q["price"]:,.2f}'
     return (f'<div class="asset {cls}"><div class="asset-name">{name}</div><div class="muted">{subtitle}{extra}</div>'
             f'<div class="asset-bottom"><span class="asset-price">{price}</span>'
@@ -510,16 +500,14 @@ def render_dashboard():
         quotes = load_quotes()
     dynamic_weights = load_qqq_weights()
     weights = dynamic_weights or {sym: weight for sym, _, weight in STOCKS}
-    score, coverage, groups, mode, details = calc_score(quotes, now, weights)
+    score, coverage, groups, mode, details, score_date = calc_score(quotes, now, weights)
     classification, status_color = classify(score)
     score_str = f'{score:+d}' if score is not None else '—'
-    score_color = ('#a4b6c8' if score is None else
-                   '#ff4265' if score <= -20 else
-                   '#ffd25b' if score < 20 else '#15d99b')
-    score_mode = ('LEITURA COM ÚLTIMOS FECHAMENTOS · INFORMATIVA' if mode == 'fechamento'
-                  else 'LEITURA COM COTAÇÕES RECENTES' if mode == 'recente'
-                  else 'SEM COBERTURA RECENTE SUFICIENTE')
-    st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 3.0</div>
+    score_color = ('#a4b6c8' if score is None else '#ff4265' if score <= -20 else '#ffd25b' if score < 20 else '#15d99b')
+    score_mode = (f'FECHAMENTO HISTÓRICO {score_date.strftime("%d/%m/%Y")} · INFORMATIVO' if mode == 'fechamento'
+                  else 'LIVE · COTAÇÕES RECENTES' if mode == 'recente'
+                  else 'SEM COBERTURA SUFICIENTE PARA SCORE')
+    st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 3.1</div>
     <div class="muted">BRASÍLIA · {now.strftime('%d/%m/%Y %H:%M:%S')} · ↻ 60 SEG</div></div>''', unsafe_allow_html=True)
     position = 50 if score is None else max(0, min(100, (score + 100) / 2))
     st.markdown(f'''<div class="summary-grid">
@@ -552,7 +540,7 @@ def render_dashboard():
     if not impact_html:
         impact_html = '<div class="tiny">Sinais atuais indisponíveis.</div>'
     audit_html = '<div class="section" style="font-size:14px;margin-top:12px">AUDITORIA DO WAR SCORE</div>'
-    audit_html += f'<div class="tiny">Modo: {"FECHAMENTOS / INFORMATIVO" if mode == "fechamento" else "RECENTE"} · Cobertura efetiva: {coverage:.0%} · Mínimo: 75%</div>'
+    audit_html += f'<div class="tiny">Modo: {html.escape(score_mode)} · Cobertura efetiva: {coverage:.0%} · Mínimo: 75%</div>'
     for group, detail in details.items():
         value = detail['value']
         state = 'INCLUÍDO' if value is not None else 'EXCLUÍDO'
@@ -563,7 +551,6 @@ def render_dashboard():
                        f'<div class="tiny">Utilizados: {html.escape(", ".join(detail["used"]) or "nenhum")}</div>'
                        f'<div class="tiny">Excluídos: {html.escape("; ".join(detail["excluded"]) or "nenhum")}</div></div>')
     audit_html += '<div class="tiny">Contribuições antes da normalização por cobertura. Com dados faltantes, os pesos válidos são renormalizados. Grupos parcialmente disponíveis usam somente os componentes válidos.</div>'
-
     news = load_news()
     news_html = ''
     for i, item in enumerate(news, 1):
@@ -586,7 +573,7 @@ def render_dashboard():
         news_html = '<div class="tiny">Nenhuma notícia relevante de fonte financeira selecionada encontrada nas últimas 24h. Não exibimos notícias genéricas para preencher espaço.</div>'
     st.markdown(f'<div class="war-panel"><div class="section">MAIORES IMPACTOS NO MNQ</div>{impact_html}{audit_html}<div class="tiny">Grupos agregados para reduzir dupla contagem. Pesos experimentais.</div></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="war-panel"><div class="section">NOTÍCIAS RELEVANTES · TOP 3 POR PRIORIDADE</div>{news_html}</div>', unsafe_allow_html=True)
-    st.markdown('''<div class="war-panel tiny">Cotações: Yahoo Finance (yfinance), sujeitas a atrasos e indisponibilidade. Notícias: Google News RSS, fontes financeiras selecionadas e tradução automática (pode falhar). Direção das notícias: heurística restrita ao movimento explícito descrito na manchete, não é previsão de impacto. Atualização Streamlit a cada 60 segundos enquanto a sessão estiver conectada; fontes possuem cache e atraso próprios. Percentuais contra o último fechamento diário anterior disponível. Fora das sessões de referência, leitura de fechamentos informativa; durante sessões mistas, somente dados recentes entram na pontuação. Horários de feriados e sessões especiais não são validados. Pesos e escala de intensidade são hipóteses não validadas por backtest; o WAR SCORE não é recomendação nem sinal de entrada.</div>''', unsafe_allow_html=True)
+    st.markdown('''<div class="war-panel tiny">Cotações: Yahoo Finance (yfinance), sujeitas a atrasos e indisponibilidade. Notícias: Google News RSS, fontes financeiras selecionadas e tradução automática (pode falhar). Direção das notícias: heurística restrita ao movimento explícito descrito na manchete, não é previsão de impacto. Atualização Streamlit a cada 60 segundos enquanto a sessão estiver conectada; fontes possuem cache e atraso próprios. Percentuais contra o último fechamento diário anterior disponível. O modo LIVE exige cotações recentes; o modo FECHAMENTO usa dados históricos de uma mesma data de negociação, sem misturá-los com o LIVE. Horários de feriados e sessões especiais não são validados. Pesos e escala de intensidade são hipóteses não validadas por backtest; o WAR SCORE não é recomendação nem sinal de entrada.</div>''', unsafe_allow_html=True)
 
 
 render_dashboard()
