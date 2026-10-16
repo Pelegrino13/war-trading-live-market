@@ -437,6 +437,9 @@ def render_dashboard():
     score, coverage, groups, mode = calc_score(quotes, now, weights)
     classification, status_color = classify(score)
     score_str = f'{score:+d}' if score is not None else '—'
+    score_color = ('#a4b6c8' if score is None else
+                   '#ff4265' if score <= -20 else
+                   '#ffd25b' if score < 20 else '#15d99b')
     score_mode = ('LEITURA COM ÚLTIMOS FECHAMENTOS · INFORMATIVA' if mode == 'fechamento'
                   else 'LEITURA COM COTAÇÕES RECENTES' if mode == 'recente'
                   else 'SEM COBERTURA RECENTE SUFICIENTE')
@@ -449,7 +452,7 @@ def render_dashboard():
     <div class="muted">Leitura intermarket: {score_str}. Cobertura de grupos: {coverage:.0%}.
     {score_mode}. NQ é referência, não soma. Indicador experimental; não é sinal de entrada.</div></div>
     <div class="war-panel"><div class="section">WAR SCORE MNQ</div>
-    <div class="status" style="text-align:center">{score_str}</div>
+    <div class="status" style="text-align:center;color:{score_color}">{score_str}</div>
     <div class="gauge"><div class="gauge-pin" style="left:{position}%"></div></div>
     <div class="tiny">-100 BAIXA | 0 NEUTRO | +100 ALTA</div></div></div>''', unsafe_allow_html=True)
     st.markdown('<div class="section">RADAR INTERMARKET · 8 ATIVOS</div>', unsafe_allow_html=True)
