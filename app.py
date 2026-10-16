@@ -11,7 +11,7 @@ from email.utils import parsedate_to_datetime
 import html
 import re
 
-st.set_page_config(page_title='WAR TRADING — LIVE MARKET 2.8', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='WAR TRADING — LIVE MARKET 2.9', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
 BRT = ZoneInfo('America/Sao_Paulo')
 NY = ZoneInfo('America/New_York')
 STOCKS = [('NVDA', 'Nvidia', 8.31), ('AAPL', 'Apple', 7.51), ('MSFT', 'Microsoft', 6.09), ('MU', 'Micron', 4.48)]
@@ -166,48 +166,77 @@ def quote_status(q, symbol, now):
 
 
 def score_news_title(title):
+    """Seleciona eventos econômicos e notícias de mercado, não páginas de instrumentos."""
     t = title.casefold()
-    excluded = ('utility rate', 'electric rate', 'water rate', 'insurance rate',
-                'rate hike for', 'rate hike on', 'rate increase for', 'rate increase on',
-                'local jobs report', 'state releases', 'school', 'county', 'city council',
-                'ballroom', 'wedding', 'celebrity', 'football', 'soccer', 'insider sells',
-                'insider buys', 'price target', 'analyst rating', 'shares sold',
-                'shares bought', 'class action', 'lawsuit filed')
-    if any(x in t for x in excluded):
+    blocked = (
+        'option chain', 'options chain', 'option quotes', 'options quotes',
+        'total return index', 'historical data', 'historical prices',
+        'stock quote', 'stock price history', 'real-time quote', 'realtime quote',
+        'market cap', 'dividend history', 'technical analysis', 'price target',
+        'analyst rating', 'insider sells', 'insider buys', 'shares sold',
+        'shares bought', 'class action', 'lawsuit filed', 'earnings calendar',
+        'economic calendar', 'etf holdings', 'index methodology',
+        'utility rate', 'electric rate', 'water rate', 'insurance rate',
+        'rate hike for', 'rate hike on', 'rate increase for', 'rate increase on',
+        'local jobs report', 'state releases', 'school', 'county', 'city council',
+        'ballroom', 'wedding', 'celebrity', 'football', 'soccer',
+        'how to buy', 'should you buy', 'best stocks to buy', 'stock forecast',
+        'what is', 'explained:', 'price prediction', 'investing guide',
+    )
+    if any(phrase in t for phrase in blocked):
         return None
     categories = [
-        ('FED / JUROS', 12, ('federal reserve', 'fomc', 'fed chair', 'fed governor',
-                              'fed officials', 'fed rate', 'fed cuts', 'fed hikes', 'powell says')),
-        ('INFLAÇÃO / EMPREGO', 12, ('us cpi', 'u.s. cpi', 'consumer price index',
-                                    'core pce', 'pce inflation', 'us payrolls',
-                                    'nonfarm payroll', 'us jobs report', 'u.s. jobs report',
-                                    'us unemployment', 'producer price index')),
-        ('TREASURIES / DÓLAR', 10, ('treasury yields', 'treasury yield', '10-year yield',
-                                    'us 10-year', 'u.s. 10-year', 'dollar index', 'dxy')),
-        ('NASDAQ / MERCADO', 11, ('nasdaq 100', 'nasdaq-100', 'nasdaq futures',
-                                  'nasdaq composite', 'wall street stocks',
-                                  's&p 500 futures', 'us stock futures', 'u.s. stock futures')),
-        ('BALANÇOS BIG TECH', 11, ('nvidia earnings', 'microsoft earnings',
-                                   'apple earnings', 'amazon earnings',
-                                   'alphabet earnings', 'meta earnings',
-                                   'tesla earnings', 'micron earnings', 'broadcom earnings')),
-        ('SEMICONDUTORES / IA', 9, ('semiconductor stocks', 'chip stocks', 'ai chip',
-                                    'semiconductor export', 'chip export restrictions', 'nvidia ai chips')),
+        ('FED / JUROS', 14, ('federal reserve', 'fomc', 'fed chair',
+            'fed governor', 'fed officials', 'fed rate', 'fed cuts',
+            'fed hikes', 'powell says', 'fed president', 'interest rate decision')),
+        ('INFLAÇÃO / EMPREGO', 14, ('us cpi', 'u.s. cpi', 'consumer price index',
+            'core pce', 'pce inflation', 'us payrolls', 'nonfarm payroll',
+            'us jobs report', 'u.s. jobs report', 'us unemployment',
+            'producer price index', 'us inflation', 'u.s. inflation')),
+        ('TREASURIES / DÓLAR', 11, ('treasury yields', 'treasury yield',
+            '10-year yield', 'us 10-year', 'u.s. 10-year', 'dollar index', 'dxy')),
+        ('NASDAQ / MERCADO', 12, ('nasdaq 100', 'nasdaq-100', 'nasdaq futures',
+            'nasdaq composite', 'wall street stocks', 's&p 500 futures',
+            'us stock futures', 'u.s. stock futures', 'wall street falls',
+            'wall street rises', 'wall street rallies', 'wall street slides')),
+        ('BALANÇOS BIG TECH', 12, ('nvidia earnings', 'microsoft earnings',
+            'apple earnings', 'amazon earnings', 'alphabet earnings',
+            'meta earnings', 'tesla earnings', 'micron earnings',
+            'broadcom earnings', 'nvidia results', 'microsoft results',
+            'apple results', 'amazon results', 'alphabet results')),
+        ('SEMICONDUTORES / IA', 10, ('semiconductor stocks', 'chip stocks',
+            'ai chip', 'semiconductor export', 'chip export restrictions',
+            'nvidia ai chips', 'chipmakers', 'semiconductor tariffs')),
     ]
     hits = [(weight, category) for category, weight, phrases in categories
             if any(phrase in t for phrase in phrases)]
-    return max(hits) if hits else None
+    if not hits:
+        return None
+    # A menção a um índice, isoladamente, não constitui uma notícia.
+    category = max(hits)[1]
+    if category == 'NASDAQ / MERCADO':
+        event_words = (r'\b(fall|falls|fell|drop|drops|dropped|slide|slides|'
+                       r'rise|rises|rose|gain|gains|gained|rally|rallies|'
+                       r'jump|jumps|surge|surges|slump|slumps|sink|sinks|'
+                       r'tumble|tumbles|plunge|plunges|rebound|rebounds|'
+                       r'flat|steady|mixed|slip|slips|dip|dips|retreat|'
+                       r'climb|climbs|edge|edges|trade|trades|trading|'
+                       r'open|opens|close|closes|futures|selloff|sell-off)\b')
+        if not re.search(event_words, t):
+            return None
+    return max(hits)
 
 
 def news_direction(title):
-    """Apenas manchetes com movimento explícito de índices/futuros; sem inferir causalidade."""
+    """Rotula movimento observado do Nasdaq, sem prever reação a eventos macro."""
     t = title.casefold()
-    if not any(x in t for x in ('nasdaq', 's&p 500', 'stock futures', 'stocks', 'wall street')):
+    # Exige que a manchete trate do mercado de ações, não de outro ativo.
+    if not re.search(r'\b(nasdaq|s&p 500|stock futures|stocks|wall street)\b', t):
         return None
-    positive = (r'\b(rise|rises|rose|gain|gains|gained|rally|rallies|jump|jumps|surge|surges|rebound|rebounds|climb|climbs)\b',)
-    negative = (r'\b(fall|falls|fell|drop|drops|dropped|slide|slides|slump|slumps|sink|sinks|tumble|tumbles|plunge|plunges)\b',)
-    up = any(re.search(p, t) for p in positive)
-    down = any(re.search(p, t) for p in negative)
+    up = bool(re.search(r'\b(rise|rises|rose|gain|gains|gained|rally|rallies|'
+                        r'jump|jumps|surge|surges|rebound|rebounds|climb|climbs)\b', t))
+    down = bool(re.search(r'\b(fall|falls|fell|drop|drops|dropped|slide|slides|'
+                          r'slump|slumps|sink|sinks|tumble|tumbles|plunge|plunges)\b', t))
     if up == down:
         return None
     return 'POSITIVO NASDAQ' if up else 'NEGATIVO NASDAQ'
@@ -229,13 +258,13 @@ def translate_title(title):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_news():
-    now = datetime.now(BRT)  # Atualizar dentro da função cacheada, não usar hora global.
+    now = datetime.now(BRT)
     searches = [
-        '("Federal Reserve" OR FOMC OR "Jerome Powell") (stocks OR markets OR rates) when:1d',
+        '("Federal Reserve" OR FOMC OR "Fed chair") (stocks OR markets OR rates) when:1d',
         '("US CPI" OR "core PCE" OR "nonfarm payroll" OR "Treasury yields") when:1d',
-        '("Nasdaq 100" OR "Nasdaq futures" OR "S&P 500 futures") when:1d',
+        '("Nasdaq futures" OR "S&P 500 futures" OR "Nasdaq composite") when:1d',
         '("Nvidia earnings" OR "Microsoft earnings" OR "Apple earnings" OR "Amazon earnings" OR "Meta earnings") when:1d',
-        '("semiconductor stocks" OR "AI chip" OR "chip export restrictions") when:1d',
+        '("semiconductor stocks" OR "AI chips" OR "chip export restrictions") when:1d',
     ]
     allowed = ('reuters', 'bloomberg', 'cnbc', 'associated press', 'ap news',
                'marketwatch', 'yahoo finance', 'financial times', 'barron',
@@ -265,8 +294,10 @@ def load_news():
                 if ranked is None:
                     continue
                 priority, category = ranked
-                points = priority * 100 - age.total_seconds() / 3600 * 3
-                key = re.sub(r'[^a-z0-9]+', '', title.casefold().split(' - ')[0])[:100]
+                # Penalidade moderada por idade; macro tem prioridade sobre manchetes genéricas.
+                points = priority * 100 - age.total_seconds() / 3600 * 4
+                base = re.sub(r'\s+-\s+[^-]+$', '', title).casefold()
+                key = re.sub(r'[^a-z0-9]+', '', base)[:110]
                 row = dict(title=title, url=link, source=source, when=when,
                            category=category, points=points, direction=news_direction(title))
                 if key not in found or points > found[key]['points']:
@@ -278,6 +309,18 @@ def load_news():
     for item in ordered:
         category = item['category']
         if counts.get(category, 0) >= 2:
+            continue
+        # Evita três versões da mesma manchete com títulos levemente diferentes.
+        tokens = set(re.findall(r'[a-z]{4,}', item['title'].casefold()))
+        tokens -= {'stocks', 'market', 'markets', 'nasdaq', 'futures', 'today', 'after', 'amid', 'says'}
+        duplicate = False
+        for existing in chosen:
+            other = set(re.findall(r'[a-z]{4,}', existing['title'].casefold()))
+            other -= {'stocks', 'market', 'markets', 'nasdaq', 'futures', 'today', 'after', 'amid', 'says'}
+            if len(tokens & other) >= 4 and len(tokens & other) / max(1, min(len(tokens), len(other))) >= .65:
+                duplicate = True
+                break
+        if duplicate:
             continue
         chosen.append(item)
         counts[category] = counts.get(category, 0) + 1
@@ -443,7 +486,7 @@ def render_dashboard():
     score_mode = ('LEITURA COM ÚLTIMOS FECHAMENTOS · INFORMATIVA' if mode == 'fechamento'
                   else 'LEITURA COM COTAÇÕES RECENTES' if mode == 'recente'
                   else 'SEM COBERTURA RECENTE SUFICIENTE')
-    st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 2.8</div>
+    st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 2.9</div>
     <div class="muted">BRASÍLIA · {now.strftime('%d/%m/%Y %H:%M:%S')} · ↻ 60 SEG</div></div>''', unsafe_allow_html=True)
     position = 50 if score is None else max(0, min(100, (score + 100) / 2))
     st.markdown(f'''<div class="summary-grid">
@@ -494,7 +537,7 @@ def render_dashboard():
                       f'<a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a>'
                       f'<div class="tiny">{item["when"].strftime("%d/%m %H:%M")} BRT · {source} · {tag}</div></div>')
     if not news_html:
-        news_html = '<div class="tiny">Nenhuma manchete verificada de fonte financeira e relevância suficiente nas últimas 24h. Não exibimos notícias genéricas para preencher espaço.</div>'
+        news_html = '<div class="tiny">Nenhuma notícia relevante de fonte financeira selecionada encontrada nas últimas 24h. Não exibimos notícias genéricas para preencher espaço.</div>'
     st.markdown(f'<div class="war-panel"><div class="section">MAIORES IMPACTOS NO MNQ</div>{impact_html}<div class="tiny">Grupos agregados para reduzir dupla contagem. Pesos experimentais.</div></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="war-panel"><div class="section">NOTÍCIAS RELEVANTES · TOP 3 POR PRIORIDADE</div>{news_html}</div>', unsafe_allow_html=True)
     st.markdown('''<div class="war-panel tiny">Cotações: Yahoo Finance (yfinance), sujeitas a atrasos e indisponibilidade. Notícias: Google News RSS, fontes financeiras selecionadas e tradução automática (pode falhar). Direção das notícias: heurística restrita ao movimento explícito descrito na manchete, não é previsão de impacto. Atualização Streamlit a cada 60 segundos enquanto a sessão estiver conectada; fontes possuem cache e atraso próprios. Percentuais contra o último fechamento diário anterior disponível. Leitura de fechamentos somente quando os mercados de referência estão fora da sessão aproximada. Horários de feriados e sessões especiais não são validados. Pesos e escala de intensidade são hipóteses não validadas por backtest; o WAR SCORE não é recomendação nem sinal de entrada.</div>''', unsafe_allow_html=True)
