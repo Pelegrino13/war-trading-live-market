@@ -11,7 +11,7 @@ from email.utils import parsedate_to_datetime
 import html
 import re
 
-st.set_page_config(page_title='WAR TRADING — LIVE MARKET 3.2', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='WAR TRADING — LIVE MARKET 3.3', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
 BRT = ZoneInfo('America/Sao_Paulo')
 NY = ZoneInfo('America/New_York')
 STOCKS = [('NVDA', 'Nvidia', 8.31), ('AAPL', 'Apple', 7.51), ('MSFT', 'Microsoft', 6.09), ('MU', 'Micron', 4.48)]
@@ -19,7 +19,7 @@ ASSETS = [('NQ', 'Nasdaq Futuro', 'NQ=F'), ('ES', 'S&P 500 Futuro', 'ES=F'),
           ('SOX', 'Semicondutores', '^SOX'), ('US10Y', 'Treasury 10 anos', '^TNX'),
           ('DXY', 'Índice do Dólar', 'DX-Y.NYB'), ('VIX', 'Volatilidade S&P 500', '^VIX'),
           ('NDX', 'Nasdaq 100 à vista', '^NDX'), ('XLK', 'ETF Tecnologia', 'XLK')]
-GROUP_WEIGHTS = {'mercado': .30, 'tecnologia': .25, 'juros_dolar': .25, 'volatilidade': .20}
+GROUP_WEIGHTS = {'mercado': .30, 'tecnologia': .40, 'juros_dolar': .15, 'volatilidade': .15}
 FUTURES = {'NQ=F', 'ES=F'}
 GROUP_COMPONENTS = {
     'mercado': [('ES', 'ES=F')],
@@ -433,6 +433,24 @@ def calc_score(quotes, now, weights):
     if live_result[0] is not None:
         return (*live_result[:3], 'recente', live_result[3], None)
 
+    # After the US cash session closes, combine today's recent futures ticks
+    # with today's completed cash-session snapshots. Never use a previous date.
+    ny_now = now.astimezone(NY)
+    today_ny = ny_now.date()
+    cash_closed = ny_now.weekday() < 5 and ny_now.time() >= time(16, 0)
+    if cash_closed:
+        session_quotes = {}
+        for _, members in GROUP_COMPONENTS.items():
+            for _, sym in members:
+                q = quotes.get(sym)
+                if (q and q.get('session_date') == today_ny
+                        and quote_status(q, sym, now) in ('recente', 'fechamento')
+                        and not q.get('daily_fallback')):
+                    session_quotes[sym] = q
+        session_result = compute(session_quotes, 'sessao')
+        if session_result[0] is not None:
+            return (*session_result[:3], 'sessao', session_result[3], today_ny)
+
     # Historical snapshot: group all components by the same NY session date.
     # Choose the most recent date with >=75% weighted coverage, within 5 days.
     dates = sorted({q['session_date'] for q in historic.values()}, reverse=True)
@@ -505,9 +523,10 @@ def render_dashboard():
     score_str = f'{score:+d}' if score is not None else '—'
     score_color = ('#a4b6c8' if score is None else '#ff4265' if score <= -20 else '#ffd25b' if score < 20 else '#15d99b')
     score_mode = (f'FECHAMENTO HISTÓRICO {score_date.strftime("%d/%m/%Y")} · INFORMATIVO' if mode == 'fechamento'
+                  else f'SESSÃO {score_date.strftime("%d/%m/%Y")} · SNAPSHOT PÓS-FECHAMENTO / INFORMATIVO' if mode == 'sessao'
                   else 'LIVE · COTAÇÕES RECENTES' if mode == 'recente'
                   else 'SEM COBERTURA SUFICIENTE PARA SCORE')
-    st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 3.2</div>
+    st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 3.3</div>
     <div class="muted">BRASÍLIA · {now.strftime('%d/%m/%Y %H:%M:%S')} · ↻ 60 SEG</div></div>''', unsafe_allow_html=True)
     position = 50 if score is None else max(0, min(100, (score + 100) / 2))
     st.markdown(f'''<div class="summary-grid">
@@ -573,7 +592,7 @@ def render_dashboard():
         news_html = '<div class="tiny">Nenhuma notícia relevante de fonte financeira selecionada encontrada nas últimas 24h. Não exibimos notícias genéricas para preencher espaço.</div>'
     st.markdown(f'<div class="war-panel"><div class="section">MAIORES IMPACTOS NO MNQ</div>{impact_html}{audit_html}<div class="tiny">Grupos agregados para reduzir dupla contagem. Pesos experimentais.</div></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="war-panel"><div class="section">NOTÍCIAS RELEVANTES · TOP 3 POR PRIORIDADE</div>{news_html}</div>', unsafe_allow_html=True)
-    st.markdown('''<div class="war-panel tiny">Cotações: Yahoo Finance (yfinance), sujeitas a atrasos e indisponibilidade. Notícias: Google News RSS, fontes financeiras selecionadas e tradução automática (pode falhar). Direção das notícias: heurística restrita ao movimento explícito descrito na manchete, não é previsão de impacto. Atualização Streamlit a cada 60 segundos enquanto a sessão estiver conectada; fontes possuem cache e atraso próprios. Percentuais contra o último fechamento diário anterior disponível. O modo LIVE exige cotações recentes; o modo FECHAMENTO usa dados históricos de uma mesma data de negociação, sem misturá-los com o LIVE. Horários de feriados e sessões especiais não são validados. Pesos e escala de intensidade são hipóteses não validadas por backtest; o WAR SCORE não é recomendação nem sinal de entrada.</div>''', unsafe_allow_html=True)
+    st.markdown('''<div class="war-panel tiny">Cotações: Yahoo Finance (yfinance), sujeitas a atrasos e indisponibilidade. Notícias: Google News RSS, fontes financeiras selecionadas e tradução automática (pode falhar). Direção das notícias: heurística restrita ao movimento explícito descrito na manchete, não é previsão de impacto. Atualização Streamlit a cada 60 segundos enquanto a sessão estiver conectada; fontes possuem cache e atraso próprios. Percentuais contra o último fechamento diário anterior disponível. O modo LIVE exige cotações recentes; o modo FECHAMENTO usa dados históricos de uma mesma data de negociação, sem misturá-los com o LIVE. Horários de feriados e sessões especiais não são validados. Pesos 30% mercado, 40% tecnologia, 15% juros/dólar e 15% volatilidade; escala de intensidade são hipóteses não validadas por backtest; o WAR SCORE não é recomendação nem sinal de entrada.</div>''', unsafe_allow_html=True)
 
 
 render_dashboard()
