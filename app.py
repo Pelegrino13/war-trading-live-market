@@ -11,23 +11,23 @@ from email.utils import parsedate_to_datetime
 import html
 import re
 
-st.set_page_config(page_title='WAR TRADING — LIVE MARKET 3.1', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='WAR TRADING — LIVE MARKET 3.2', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
 BRT = ZoneInfo('America/Sao_Paulo')
 NY = ZoneInfo('America/New_York')
 STOCKS = [('NVDA', 'Nvidia', 8.31), ('AAPL', 'Apple', 7.51), ('MSFT', 'Microsoft', 6.09), ('MU', 'Micron', 4.48)]
 ASSETS = [('NQ', 'Nasdaq Futuro', 'NQ=F'), ('ES', 'S&P 500 Futuro', 'ES=F'),
           ('SOX', 'Semicondutores', '^SOX'), ('US10Y', 'Treasury 10 anos', '^TNX'),
           ('DXY', 'Índice do Dólar', 'DX-Y.NYB'), ('VIX', 'Volatilidade S&P 500', '^VIX'),
-          ('VXN', 'Volatilidade Nasdaq', '^VXN'), ('XLK', 'ETF Tecnologia', 'XLK')]
+          ('NDX', 'Nasdaq 100 à vista', '^NDX'), ('XLK', 'ETF Tecnologia', 'XLK')]
 GROUP_WEIGHTS = {'mercado': .30, 'tecnologia': .25, 'juros_dolar': .25, 'volatilidade': .20}
 FUTURES = {'NQ=F', 'ES=F'}
 GROUP_COMPONENTS = {
     'mercado': [('ES', 'ES=F')],
     'tecnologia': [('SOX', '^SOX'), ('XLK', 'XLK'), ('NVDA', 'NVDA'), ('AAPL', 'AAPL'), ('MSFT', 'MSFT'), ('MU', 'MU')],
     'juros_dolar': [('US10Y', '^TNX'), ('DXY', 'DX-Y.NYB')],
-    'volatilidade': [('VIX', '^VIX'), ('VXN', '^VXN')],
+    'volatilidade': [('VIX', '^VIX')],
 }
-GROUP_NAMES = {'mercado': 'ES', 'tecnologia': 'SOX / XLK / AÇÕES', 'juros_dolar': 'US10Y / DXY', 'volatilidade': 'VIX / VXN'}
+GROUP_NAMES = {'mercado': 'ES', 'tecnologia': 'SOX / XLK / AÇÕES', 'juros_dolar': 'US10Y / DXY', 'volatilidade': 'VIX'}
 STATUS_NAMES = {'recente': 'recente', 'fechamento': 'último fechamento', 'obsoleta': 'atrasada', 'sem_referencia': 'sem referência de variação'}
 
 st.markdown('''<style>
@@ -414,7 +414,7 @@ def calc_score(quotes, now, weights):
         tech = sum(v * w for v, w in tech_parts) / sum(w for _, w in tech_parts) if tech_parts else None
         groups = {'mercado': signal('ES=F'), 'tecnologia': tech,
                   'juros_dolar': average(signal('^TNX', True), signal('DX-Y.NYB', True)),
-                  'volatilidade': average(signal('^VIX', True), signal('^VXN', True))}
+                  'volatilidade': signal('^VIX', True)}
         coverage = sum(GROUP_WEIGHTS[k] for k, v in groups.items() if v is not None)
         score = round(100 * sum(GROUP_WEIGHTS[k] * v for k, v in groups.items() if v is not None) / coverage) if coverage >= .75 else None
         details = {}
@@ -507,7 +507,7 @@ def render_dashboard():
     score_mode = (f'FECHAMENTO HISTÓRICO {score_date.strftime("%d/%m/%Y")} · INFORMATIVO' if mode == 'fechamento'
                   else 'LIVE · COTAÇÕES RECENTES' if mode == 'recente'
                   else 'SEM COBERTURA SUFICIENTE PARA SCORE')
-    st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 3.1</div>
+    st.markdown(f'''<div class="war-panel"><div class="brand">WAR TRADING</div><div class="subbrand">LIVE MARKET 3.2</div>
     <div class="muted">BRASÍLIA · {now.strftime('%d/%m/%Y %H:%M:%S')} · ↻ 60 SEG</div></div>''', unsafe_allow_html=True)
     position = 50 if score is None else max(0, min(100, (score + 100) / 2))
     st.markdown(f'''<div class="summary-grid">
@@ -528,7 +528,7 @@ def render_dashboard():
         st.caption('Pesos ilustrativos de referência do QQQ em 13/10/2026; consulta dinâmica indisponível. Confirme a composição antes de operar.')
     st.markdown('<div class="asset-grid">' + ''.join(asset_card(sym, company, quotes.get(sym), sym, now, f' · peso ref. {weights[sym]:.2f}%') for sym, company, _ in STOCKS) + '</div>', unsafe_allow_html=True)
     impacts = []
-    for label, group in [('ES', 'mercado'), ('SOX / XLK / AÇÕES', 'tecnologia'), ('US10Y / DXY', 'juros_dolar'), ('VIX / VXN', 'volatilidade')]:
+    for label, group in [('ES', 'mercado'), ('SOX / XLK / AÇÕES', 'tecnologia'), ('US10Y / DXY', 'juros_dolar'), ('VIX', 'volatilidade')]:
         value = groups[group]
         if value is not None:
             impacts.append((abs(value * GROUP_WEIGHTS[group]), label, value, GROUP_WEIGHTS[group]))
